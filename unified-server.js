@@ -19,7 +19,7 @@ class AuthSource {
     this.logger = logger;
     this.authMode = "file";
     this.availableIndices = [];
-    this.initialIndices = []; // 新增：用于存储初步发现的所有索引
+    this.initialIndices = [];
     this.accountNameMap = new Map();
 
     if (process.env.AUTH_JSON_1) {
@@ -224,7 +224,7 @@ class BrowserManager {
         args: this.launchArgs,
       });
       this.browser.on("disconnected", () => {
-        this.logger.error("❌ [Browser] 浏览器意外断开连接！(可能是资源不足)");
+        this.logger.error("❌ [Browser] 浏览器意外断开连接！");
         this.browser = null;
         this.context = null;
         this.page = null;
@@ -709,12 +709,14 @@ class RequestHandler {
   }
 
   async _switchToNextAuth() {
-    if (this.authSource.availableIndices.length <= 1) {
-      this.logger.warn("[Auth] 😕 检测到只有一个可用账号，拒绝切换操作。");
-      throw new Error("Only one account is available, cannot switch.");
+    const available = this.authSource.availableIndices;
+
+    if (available.length === 0) {
+      throw new Error("没有可用的认证源，无法切换。");
     }
+
     if (this.isAuthSwitching) {
-      this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
+      this.logger.info("🔄 [Auth] 正在切换/重启账号，跳过重复操作");
       return { success: false, reason: "Switch already in progress." };
     }
 
@@ -723,11 +725,41 @@ class RequestHandler {
     this.isAuthSwitching = true;
 
     try {
+      // 单账号模式 - 执行原地重启 (Refresh)
+      if (available.length === 1) {
+        const singleIndex = available[0];
+        this.logger.info("==================================================");
+        this.logger.info(
+          `🔄 [Auth] 单账号模式：达到轮换阈值，正在执行原地重启...`
+        );
+        this.logger.info(`   • 目标账号: #${singleIndex}`);
+        this.logger.info("==================================================");
+
+        try {
+          // 强制重新加载当前账号的 Context
+          await this.browserManager.launchOrSwitchContext(singleIndex);
+
+          // 关键：重置计数器
+          this.failureCount = 0;
+          this.usageCount = 0;
+
+          this.logger.info(
+            `✅ [Auth] 单账号 #${singleIndex} 重启/刷新成功，使用计数已清零。`
+          );
+          return { success: true, newIndex: singleIndex };
+        } catch (error) {
+          this.logger.error(`❌ [Auth] 单账号重启失败: ${error.message}`);
+          throw error;
+        }
+      }
+
+      // 多账号模式 - 执行轮换 (Rotate)
+
       const previousAuthIndex = this.currentAuthIndex;
       const nextAuthIndex = this._getNextAuthIndex();
 
       this.logger.info("==================================================");
-      this.logger.info(`🔄 [Auth] 开始账号切换流程`);
+      this.logger.info(`🔄 [Auth] 多账号模式：开始账号切换流程`);
       this.logger.info(`   • 当前账号: #${previousAuthIndex}`);
       this.logger.info(`   • 目标账号: #${nextAuthIndex}`);
       this.logger.info("==================================================");
@@ -766,7 +798,6 @@ class RequestHandler {
         }
       }
     } finally {
-      // --- 解锁！---
       this.isAuthSwitching = false;
       this.isSystemBusy = false;
     }
@@ -982,14 +1013,23 @@ class RequestHandler {
     }
   }
 
-  // unified-server.js 文件内，RequestHandler 类中的 processOpenAIRequest 函数
-
   async processOpenAIRequest(req, res) {
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
     const model = req.body.model || "gemini-1.5-pro-latest";
+    const systemStreamMode = this.serverSystem.streamingMode;
+    const useRealStream = isOpenAIStream && systemStreamMode === "real";
 
-    // 1. 翻译请求体 (逻辑保持不变)
+    if (this.config.switchOnUses > 0) {
+      this.usageCount++;
+      this.logger.info(
+        `[Request] OpenAI生成请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
+      );
+      if (this.usageCount >= this.config.switchOnUses) {
+        this.needsSwitchingAfterRequest = true;
+      }
+    }
+
     let googleBody;
     try {
       googleBody = this._translateOpenAIToGoogle(req.body, model);
@@ -1002,60 +1042,46 @@ class RequestHandler {
       );
     }
 
-    // 2. 构建代理请求 (逻辑保持不变)
-    const googleEndpoint = isOpenAIStream
+    const googleEndpoint = useRealStream
       ? "streamGenerateContent"
       : "generateContent";
     const proxyRequest = {
       path: `/v1beta/models/${model}:${googleEndpoint}`,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      query_params: isOpenAIStream ? { alt: "sse" } : {},
+      query_params: useRealStream ? { alt: "sse" } : {},
       body: JSON.stringify(googleBody),
       request_id: requestId,
-      // [关键修改] 明确标记这是一个生成式请求，以便切换逻辑可以正确重置失败计数
       is_generative: true,
-      streaming_mode: "real",
-      client_wants_stream: true,
+      streaming_mode: useRealStream ? "real" : "fake",
     };
 
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
-      // [新增-步骤1] 统一发送请求并等待初始响应
       this._forwardRequest(proxyRequest);
-      const initialMessage = await messageQueue.dequeue(); // 等待第一个消息，可能是headers或error
+      const initialMessage = await messageQueue.dequeue();
 
-      // [新增-步骤2] 检查初始响应是否为错误
       if (initialMessage.event_type === "error") {
-        // 如果是错误，则触发失败处理和账户切换逻辑
         this.logger.error(
           `[Adapter] 收到来自浏览器的错误，将触发切换逻辑。状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`
         );
-
-        // 调用现有的切换逻辑
         await this._handleRequestFailureAndSwitch(initialMessage, res);
-
-        // 根据请求是流式还是非流式，以合适的方式结束响应
         if (isOpenAIStream) {
-          // 对于流式请求，在发送完错误块后（由_handleRequestFailureAndSwitch内部完成），
-          // 发送一个 [DONE] 信号并结束响应，是符合OpenAI规范的健壮做法。
           if (!res.writableEnded) {
             res.write("data: [DONE]\n\n");
             res.end();
           }
         } else {
-          // 对于非流式请求，直接发送一个标准的JSON错误响应
           this._sendErrorResponse(
             res,
             initialMessage.status || 500,
             initialMessage.message
           );
         }
-        return; // 处理完毕，提前退出函数
+        return;
       }
 
-      // [新增-步骤3] 如果初始响应不是错误，则说明请求成功，重置失败计数
       if (this.failureCount > 0) {
         this.logger.info(
           `✅ [Auth] OpenAI接口请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
@@ -1063,55 +1089,76 @@ class RequestHandler {
         this.failureCount = 0;
       }
 
-      // [逻辑微调] 将原有代码放入 else 块中，并根据流式/非流式分别处理
       if (isOpenAIStream) {
-        // --- 处理流式响应 ---
         res.status(200).set({
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
 
-        // initialMessage 是 headers，在OpenAI适配器中我们不需要它，所以直接开始循环处理后续的 chunk
-        let lastGoogleChunk = "";
-        while (true) {
-          const message = await messageQueue.dequeue(300000); // 5分钟超时
-          if (message.type === "STREAM_END") {
-            res.write("data: [DONE]\n\n");
-            break;
-          }
-          if (message.data) {
-            const translatedChunk = this._translateGoogleToOpenAIStream(
-              message.data,
-              model
-            );
-            if (translatedChunk) {
-              res.write(translatedChunk);
-            }
-            lastGoogleChunk = message.data; // [修正] 总是记录最后一个数据块
-          }
-        }
+        if (useRealStream) {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Real Mode) 已启动...`);
+          let lastGoogleChunk = "";
+          const streamState = { inThought: false };
 
-        // 记录结束原因
-        try {
-          if (lastGoogleChunk.startsWith("data: ")) {
-            const jsonString = lastGoogleChunk.substring(6).trim();
-            if (jsonString) {
-              const lastResponse = JSON.parse(jsonString);
-              const finishReason =
-                lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
-              this.logger.info(
-                `✅ [Request] OpenAI流式响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+          while (true) {
+            const message = await messageQueue.dequeue(300000); // 5分钟超时
+            if (message.type === "STREAM_END") {
+              if (streamState.inThought) {
+                const closeThoughtPayload = {
+                  id: `chatcmpl-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: "\n</think>\n" },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                res.write(`data: ${JSON.stringify(closeThoughtPayload)}\n\n`);
+              }
+              res.write("data: [DONE]\n\n");
+              break;
+            }
+            if (message.data) {
+              // [修改] 将 streamState 传递给翻译函数
+              const translatedChunk = this._translateGoogleToOpenAIStream(
+                message.data,
+                model,
+                streamState
               );
+              if (translatedChunk) {
+                res.write(translatedChunk);
+              }
+              lastGoogleChunk = message.data;
             }
           }
-        } catch (e) {
-          // 解析失败则不记录
+        } else {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Fake Mode) 已启动...`);
+
+          let fullBody = "";
+          while (true) {
+            const message = await messageQueue.dequeue(300000);
+            if (message.type === "STREAM_END") break;
+            if (message.data) fullBody += message.data;
+          }
+
+          const translatedChunk = this._translateGoogleToOpenAIStream(
+            fullBody,
+            model
+          );
+          if (translatedChunk) {
+            res.write(translatedChunk);
+          }
+          res.write("data: [DONE]\n\n");
+          this.logger.info(
+            `[Adapter] Fake模式：已一次性发送完整内容并结束流。`
+          );
         }
       } else {
-        // --- 处理非流式响应 ---
-        // initialMessage 是 headers，同样不需要。现在等待body。
-        // [修正] 非流式响应也可能被分块，需要循环接收直到结束
         let fullBody = "";
         while (true) {
           const message = await messageQueue.dequeue(300000);
@@ -1126,7 +1173,6 @@ class RequestHandler {
         const googleResponse = JSON.parse(fullBody);
         const candidate = googleResponse.candidates?.[0];
 
-        // 后续的翻译逻辑保持不变...
         let responseContent = "";
         if (
           candidate &&
@@ -1141,8 +1187,25 @@ class RequestHandler {
               "[Adapter] 从 parts.inlineData 中成功解析到图片。"
             );
           } else {
-            responseContent =
-              candidate.content.parts.map((p) => p.text).join("\n") || "";
+            let mainContent = "";
+            let reasoningContent = "";
+
+            candidate.content.parts.forEach((p) => {
+              if (p.thought) {
+                reasoningContent += p.text;
+              } else {
+                mainContent += p.text;
+              }
+            });
+
+            responseContent = mainContent;
+            var messageObj = {
+              role: "assistant",
+              content: responseContent,
+            };
+            if (reasoningContent) {
+              messageObj.reasoning_content = reasoningContent;
+            }
           }
         }
 
@@ -1154,8 +1217,9 @@ class RequestHandler {
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: responseContent },
-              finish_reason: candidate?.finishReason || "UNKNOWN",
+              // 使用上面构建的 messageObj
+              message: messageObj || { role: "assistant", content: "" },
+              finish_reason: candidate?.finishReason,
             },
           ],
         };
@@ -1168,10 +1232,18 @@ class RequestHandler {
         res.status(200).json(openaiResponse);
       }
     } catch (error) {
-      // 这个 catch 块主要处理超时等意外情况
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
+      if (this.needsSwitchingAfterRequest) {
+        this.logger.info(
+          `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
+        );
+        this._switchToNextAuth().catch((err) => {
+          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+        });
+        this.needsSwitchingAfterRequest = false;
+      }
       if (!res.writableEnded) {
         res.end();
       }
@@ -1202,10 +1274,34 @@ class RequestHandler {
     return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   }
   _buildProxyRequest(req, requestId) {
-    let requestBody = "";
-    if (req.body) {
-      requestBody = JSON.stringify(req.body);
+    let bodyObj = req.body;
+    if (
+      this.serverSystem.forceThinking &&
+      req.method === "POST" &&
+      bodyObj &&
+      bodyObj.contents
+    ) {
+      if (!bodyObj.generationConfig) {
+        bodyObj.generationConfig = {};
+      }
+
+      if (!bodyObj.generationConfig.thinkingConfig) {
+        this.logger.info(
+          `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...`
+        );
+        bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
+      } else {
+        this.logger.info(
+          `[Proxy] ✅ (Google原生格式) 检测到客户端自带推理配置，跳过强制注入。`
+        );
+      }
     }
+
+    let requestBody = "";
+    if (bodyObj) {
+      requestBody = JSON.stringify(bodyObj);
+    }
+
     return {
       path: req.path,
       method: req.method,
@@ -1250,7 +1346,7 @@ class RequestHandler {
     });
     const connectionMaintainer = setInterval(() => {
       if (!res.writableEnded) res.write(": keep-alive\n\n");
-    }, 15000);
+    }, 3000);
 
     try {
       let lastMessage,
@@ -1698,6 +1794,67 @@ class RequestHandler {
       maxOutputTokens: openaiBody.max_tokens,
       stopSequences: openaiBody.stop,
     };
+
+    const extraBody = openaiBody.extra_body || {};
+    let rawThinkingConfig =
+      extraBody.google?.thinking_config ||
+      extraBody.google?.thinkingConfig ||
+      extraBody.thinkingConfig ||
+      extraBody.thinking_config ||
+      openaiBody.thinkingConfig ||
+      openaiBody.thinking_config;
+
+    let thinkingConfig = null;
+
+    if (rawThinkingConfig) {
+      // 2. 格式清洗：将 snake_case (下划线) 转换为 camelCase (驼峰)
+      thinkingConfig = {};
+
+      // 处理开关
+      if (rawThinkingConfig.include_thoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.include_thoughts;
+      } else if (rawThinkingConfig.includeThoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
+      }
+
+      // 处理 Budget (预算)
+      // if (rawThinkingConfig.thinking_budget !== undefined) {
+      // thinkingConfig.thinkingBudgetTokenLimit =
+      // rawThinkingConfig.thinking_budget;
+      //} else if (rawThinkingConfig.thinkingBudget !== undefined) {
+      //thinkingConfig.thinkingBudgetTokenLimit =
+      //rawThinkingConfig.thinkingBudget;
+      //}
+
+      this.logger.info(
+        `[Adapter] 成功提取并转换推理配置: ${JSON.stringify(thinkingConfig)}`
+      );
+    }
+
+    // 3. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
+    if (!thinkingConfig) {
+      const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
+      if (effort) {
+        this.logger.info(
+          `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`
+        );
+        thinkingConfig = { includeThoughts: true };
+      }
+    }
+
+    // 4. 强制开启逻辑 (WebUI开关)
+    if (this.serverSystem.forceThinking && !thinkingConfig) {
+      this.logger.info(
+        "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig..."
+      );
+      thinkingConfig = { includeThoughts: true };
+    }
+
+    // 5. 写入最终配置
+    if (thinkingConfig) {
+      generationConfig.thinkingConfig = thinkingConfig;
+    }
+
     googleRequest.generationConfig = generationConfig;
 
     // 5. 安全设置
@@ -1754,22 +1911,43 @@ class RequestHandler {
       return null;
     }
 
-    // [核心修正] 引入与非流式一致的图片和文本解析逻辑
-    let content = "";
+    const delta = {};
+
     if (candidate.content && Array.isArray(candidate.content.parts)) {
       const imagePart = candidate.content.parts.find((p) => p.inlineData);
+
       if (imagePart) {
-        // 发现图片数据，生成完整的 Markdown 字符串
         const image = imagePart.inlineData;
-        content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+        delta.content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
         this.logger.info("[Adapter] 从流式响应块中成功解析到图片。");
       } else {
-        // 没有图片，则按原样拼接文本
-        content = candidate.content.parts.map((p) => p.text).join("") || "";
+        // 遍历所有部分，分离思考内容和正文内容
+        let contentAccumulator = "";
+        let reasoningAccumulator = "";
+
+        for (const part of candidate.content.parts) {
+          // Google API 的 thought 标记
+          if (part.thought === true) {
+            reasoningAccumulator += part.text || "";
+          } else {
+            contentAccumulator += part.text || "";
+          }
+        }
+
+        // 只有当有内容时才添加到 delta 中
+        if (reasoningAccumulator) {
+          delta.reasoning_content = reasoningAccumulator;
+        }
+        if (contentAccumulator) {
+          delta.content = contentAccumulator;
+        }
       }
     }
 
-    const finishReason = candidate.finishReason;
+    // 如果没有任何内容变更，则不返回数据（避免空行）
+    if (!delta.content && !delta.reasoning_content && !candidate.finishReason) {
+      return null;
+    }
 
     const openaiResponse = {
       id: `chatcmpl-${this._generateRequestId()}`,
@@ -1779,8 +1957,8 @@ class RequestHandler {
       choices: [
         {
           index: 0,
-          delta: { content: content },
-          finish_reason: finishReason || null,
+          delta: delta, // 使用包含 reasoning_content 的 delta
+          finish_reason: candidate.finishReason || null,
         },
       ],
     };
@@ -1795,6 +1973,8 @@ class ProxyServerSystem extends EventEmitter {
     this.logger = new LoggingService("ProxySystem");
     this._loadConfiguration(); // 这个函数会执行下面的_loadConfiguration
     this.streamingMode = this.config.streamingMode;
+
+    this.forceThinking = false;
 
     this.authSource = new AuthSource(this.logger);
     this.browserManager = new BrowserManager(
@@ -2233,33 +2413,12 @@ class ProxyServerSystem extends EventEmitter {
         .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
         .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
         @media (max-width: 600px) {
-            body { 
-                padding: 0.5em; /* 减小页面整体的边距 */
-            }
-            .container {
-                /* 关键：减小白色卡片的左右内边距，让它更宽 */
-                padding: 1em; 
-                margin: 0;
-            }
-            pre {
-                /* 关键：减小黑色代码框的内边距 */
-                padding: 1em;
-                font-size: 0.9em; /* 让字体稍微小一点，容纳更多内容 */
-            }
-            .label {
-                /* 关键：移除固定的 220px 宽度，让标签宽度自动适应 */
-                width: auto; 
-                /* 并且，我们不再需要它是一个'块'，让它和文本流在一起 */
-                display: inline;
-            }
-            .action-group {
-                flex-direction: column; /* 让操作按钮垂直堆叠 */
-                align-items: stretch; /* 让按钮占满宽度 */
-            }
-            .action-group select, .action-group button {
-                width: 100%;
-                box-sizing: border-box; 
-            }
+            body { padding: 0.5em; }
+            .container { padding: 1em; margin: 0; }
+            pre { padding: 1em; font-size: 0.9em; }
+            .label { width: auto; display: inline; }
+            .action-group { flex-direction: column; align-items: stretch; }
+            .action-group select, .action-group button { width: 100%; box-sizing: border-box; }
         }
         </style>
     </head>
@@ -2276,6 +2435,9 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">流模式</span>: ${
         config.streamingMode
       } (仅启用流式传输时生效)
+<span class="label">强制推理</span>: ${
+        this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
+      }
 <span class="label">立即切换 (状态码)</span>: ${
         config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
@@ -2309,6 +2471,7 @@ class ProxyServerSystem extends EventEmitter {
                 <select id="accountIndexSelect">${accountOptionsHtml}</select>
                 <button onclick="switchSpecificAccount()">切换账号</button>
                 <button onclick="toggleStreamingMode()">切换流模式</button>
+                <button onclick="toggleForceThinking()">切换强制推理</button>
             </div>
         </div>
         </div>
@@ -2324,6 +2487,7 @@ class ProxyServerSystem extends EventEmitter {
                     '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
                     '--- 服务配置 ---\\n' +
                     '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
+                    '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
                     '<span class="label">立即切换 (状态码)</span>: ' + data.status.immediateSwitchStatusCodes + '\\n' +
                     '<span class="label">API 密钥</span>: ' + data.status.apiKeySource + '\\n' +
                     '--- 账号状态 ---\\n' +
@@ -2357,14 +2521,14 @@ class ProxyServerSystem extends EventEmitter {
             .then(res => res.text()).then(data => { alert(data); updateContent(); })
             .catch(err => { 
                 if (err.message.includes('Load failed') || err.message.includes('NetworkError')) {
-                    alert('⚠️ 浏览器启动较慢，操作仍在后台进行中。\n\n请不要重复点击。');
+                    alert('⚠️ 浏览器启动较慢，操作仍在后台进行中。\\n\\n请不要重复点击。');
                 } else {
                     alert('❌ 操作失败: ' + err); 
                 }
                 updateContent(); 
             });
         }
-
+            
         function toggleStreamingMode() { 
             const newMode = prompt('请输入新的流模式 (real 或 fake):', '${
               this.config.streamingMode
@@ -2382,6 +2546,15 @@ class ProxyServerSystem extends EventEmitter {
             } 
         }
 
+        function toggleForceThinking() {
+            fetch('/api/toggle-force-thinking', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('设置失败: ' + err));
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             updateContent(); 
             setInterval(updateContent, 5000);
@@ -2393,7 +2566,6 @@ class ProxyServerSystem extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
-    // API 路由和代理主逻辑保持不变...
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -2413,6 +2585,7 @@ class ProxyServerSystem extends EventEmitter {
       const data = {
         status: {
           streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
+          forceThinking: this.forceThinking ? "✅ 已启用" : "❌ 已关闭",
           browserConnected: !!browserManager.browser,
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
@@ -2492,6 +2665,14 @@ class ProxyServerSystem extends EventEmitter {
         res.status(400).send('无效模式. 请用 "fake" 或 "real".');
       }
     });
+
+    app.post("/api/toggle-force-thinking", isAuthenticated, (req, res) => {
+      this.forceThinking = !this.forceThinking;
+      const statusText = this.forceThinking ? "已启用" : "已关闭";
+      this.logger.info(`[WebUI] 强制推理开关已切换为: ${statusText}`);
+      res.status(200).send(`强制推理模式: ${statusText}`);
+    });
+
     app.use(this._createAuthMiddleware());
 
     app.get("/v1/models", (req, res) => {

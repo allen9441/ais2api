@@ -13,13 +13,12 @@ const os = require("os");
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
 // ===================================================================================
-
 class AuthSource {
   constructor(logger) {
     this.logger = logger;
     this.authMode = "file";
     this.availableIndices = [];
-    this.initialIndices = []; 
+    this.initialIndices = [];
     this.accountNameMap = new Map();
 
     if (process.env.AUTH_JSON_1) {
@@ -33,8 +32,8 @@ class AuthSource {
       );
     }
 
-    this._discoverAvailableIndices(); 
-    this._preValidateAndFilter(); 
+    this._discoverAvailableIndices(); // 初步发现所有存在的源
+    this._preValidateAndFilter(); // 预检验并过滤掉格式错误的源
 
     if (this.availableIndices.length === 0) {
       this.logger.error(
@@ -48,6 +47,7 @@ class AuthSource {
     let indices = [];
     if (this.authMode === "env") {
       const regex = /^AUTH_JSON_(\d+)$/;
+      // [关键修复] 完整的 for...in 循环，用于扫描所有环境变量
       for (const key in process.env) {
         const match = key.match(regex);
         if (match && match[1]) {
@@ -55,6 +55,7 @@ class AuthSource {
         }
       }
     } else {
+      // 'file' mode
       const authDir = path.join(__dirname, "auth");
       if (!fs.existsSync(authDir)) {
         this.logger.warn('[Auth] "auth/" 目录不存在。');
@@ -74,8 +75,9 @@ class AuthSource {
       }
     }
 
+    // 存取扫描到的原始索引
     this.initialIndices = [...new Set(indices)].sort((a, b) => a - b);
-    this.availableIndices = [...this.initialIndices]; 
+    this.availableIndices = [...this.initialIndices]; // 先假设都可用
 
     this.logger.info(
       `[Auth] 在 '${this.authMode}' 模式下，初步发现 ${
@@ -92,6 +94,7 @@ class AuthSource {
     const invalidSourceDescriptions = [];
 
     for (const index of this.availableIndices) {
+      // 注意：这里我们调用一个内部的、简化的 getAuthContent
       const authContent = this._getAuthContent(index);
       if (authContent) {
         try {
@@ -122,6 +125,7 @@ class AuthSource {
     this.availableIndices = validIndices;
   }
 
+  // 一个内部辅助函数，仅用于预检验，避免日志污染
   _getAuthContent(index) {
     if (this.authMode === "env") {
       return process.env[`AUTH_JSON_${index}`];
@@ -157,12 +161,7 @@ class AuthSource {
       return null;
     }
   }
-  
-  getMaxIndex() {
-    return Math.max(...this.availableIndices, 0);
-  }
 }
-
 // ===================================================================================
 // BROWSER MANAGEMENT MODULE
 // ===================================================================================
@@ -177,10 +176,11 @@ class BrowserManager {
     this.page = null;
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
+    this.noButtonCount = 0;
     this.launchArgs = [
-      "--disable-dev-shm-usage",
+      "--disable-dev-shm-usage", // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
       "--disable-gpu",
-      "--no-sandbox",
+      "--no-sandbox", // 在受限的容器环境中通常需要
       "--disable-setuid-sandbox",
       "--disable-infobars",
       "--disable-background-networking",
@@ -209,6 +209,15 @@ class BrowserManager {
     }
   }
 
+  notifyUserActivity() {
+    if (this.noButtonCount > 0) {
+      this.logger.info(
+        "[Browser] ⚡ 收到用户请求信号，强制唤醒后台检测 (重置计数器)"
+      );
+      this.noButtonCount = 0;
+    }
+  }
+
   async launchOrSwitchContext(authIndex) {
     if (!this.browser) {
       this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
@@ -223,7 +232,7 @@ class BrowserManager {
         args: this.launchArgs,
       });
       this.browser.on("disconnected", () => {
-        this.logger.error("❌ [Browser] 浏览器意外断开连接！(可能是资源不足)");
+        this.logger.error("❌ [Browser] 浏览器意外断开连接！");
         this.browser = null;
         this.context = null;
         this.page = null;
@@ -290,83 +299,137 @@ class BrowserManager {
 
       const currentUrl = this.page.url();
       let pageTitle = "";
-      try { pageTitle = await this.page.title(); } catch (e) {}
+      try {
+        pageTitle = await this.page.title();
+      } catch (e) {
+        this.logger.warn(`[Browser] 无法获取页面标题: ${e.message}`);
+      }
 
-      // 1. 检查 Cookie 是否失效
+      this.logger.info(`[Browser] [诊断] URL: ${currentUrl}`);
+      this.logger.info(`[Browser] [诊断] Title: "${pageTitle}"`);
+
+      // 1. 检查 Cookie 是否失效 (跳转回登录页)
       if (
         currentUrl.includes("accounts.google.com") ||
         currentUrl.includes("ServiceLogin") ||
-        pageTitle.includes("Sign in")
+        pageTitle.includes("Sign in") ||
+        pageTitle.includes("登录")
       ) {
-        this.logger.error(`🚨 [环境错误] 检测到重定向至登录页，初始化中断。`);
-        this.logger.error(`   👉 URL: ${currentUrl}`);
         throw new Error(
-          "Cookie 已失效 (auth.json 过期)，浏览器被重定向到了 Google 登录页面，请重新提取。"
+          "🚨 Cookie 已失效/过期！浏览器被重定向到了 Google 登录页面。请重新提取 storageState。"
         );
       }
 
-      // 2. 检查 IP 地区限制
-      if (pageTitle.includes("Available regions")) {
-        this.logger.error(`🚨 [环境错误] 检测到地区不支持页面，初始化中断。`);
+      // 2. 检查 IP 地区限制 (Region Unsupported)
+      // 通常标题是 "Google AI Studio is not available in your location"
+      if (
+        pageTitle.includes("Available regions") ||
+        pageTitle.includes("not available")
+      ) {
         throw new Error(
-          "当前 IP 不支持访问 Google AI Studio (地区受限/送中)，请更换节点。"
+          "🚨 当前 IP 不支持访问 Google AI Studio。请更换节点后重启！"
         );
       }
 
-      // 3. 检查 IP 风控 (403)
+      // 3. 检查 IP 风控 (403 Forbidden)
       if (pageTitle.includes("403") || pageTitle.includes("Forbidden")) {
-        this.logger.error(`🚨 [环境错误] 检测到 403 Forbidden，初始化中断。`);
-        throw new Error("当前 IP 被 Google 风控拒绝访问。");
+        throw new Error(
+          "🚨 403 Forbidden：当前 IP 信誉过低，被 Google 风控拒绝访问。"
+        );
       }
 
-      // 4. 检查白屏 (网速极慢)
+      // 4. 检查白屏 (网络极差或加载失败)
       if (currentUrl === "about:blank") {
-        this.logger.error(
-          `🚨 [环境错误] 页面加载超时 (about:blank)，初始化中断。`
-        );
-        throw new Error("网络连接极差，无法加载页面。");
-      }
-
-      this.logger.info(`[Browser] 正在检查 Cookie 同意横幅...`);
-      try {
-        const agreeButton = this.page.locator('button:text("Agree")').first();
-        await agreeButton.waitFor({ state: "visible", timeout: 10000 });
-        this.logger.info(
-          `[Browser] ✅ 发现 Cookie 同意横幅，正在点击 "Agree"...`
-        );
-        await agreeButton.click({ force: true });
-        await this.page.waitForTimeout(1000);
-      } catch (error) {
-        this.logger.info(`[Browser] 未发现 Cookie 同意横幅，跳过。`);
-      }
-
-      this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
-      try {
-        const gotItButton = this.page.locator(
-          'div.dialog button:text("Got it")'
-        ).first();
-        await gotItButton.waitFor({ state: "visible", timeout: 15000 });
-        this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
-        await gotItButton.click({ force: true });
-        await this.page.waitForTimeout(1000);
-      } catch (error) {
-        this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
-      }
-
-      this.logger.info(`[Browser] 正在检查新手引导...`);
-      try {
-        const closeButton = this.page.locator('button[aria-label="Close"]').first();
-        await closeButton.waitFor({ state: "visible", timeout: 15000 });
-        this.logger.info(`[Browser] ✅ 发现新手引导弹窗，正在点击关闭按钮...`);
-        await closeButton.click({ force: true });
-        await this.page.waitForTimeout(1000);
-      } catch (error) {
-        this.logger.info(
-          `[Browser] 未发现 "It's time to build" 新手引导，跳过。`
+        throw new Error(
+          "🚨 页面加载失败 (about:blank)，可能是网络连接超时或浏览器崩溃。"
         );
       }
 
-      this.logger.info("[Browser] 准备UI交互，强行移除所有可能的遮罩层...");
+      this.logger.info(
+        `[Browser] 进入 20秒 检查流程 (目标: Cookie + Got it + 新手引导)...`
+      );
+
+      const startTime = Date.now();
+      const timeLimit = 20000;
+
+      // 状态记录表
+      const popupStatus = {
+        cookie: false,
+        gotIt: false,
+        guide: false,
+      };
+
+      while (Date.now() - startTime < timeLimit) {
+        // 如果3个都处理过了，立刻退出 ---
+        if (popupStatus.cookie && popupStatus.gotIt && popupStatus.guide) {
+          this.logger.info(
+            `[Browser] ⚡ 完美！3个弹窗全部处理完毕，提前进入下一步。`
+          );
+          break;
+        }
+
+        let clickedInThisLoop = false;
+
+        // 1. 检查 Cookie "Agree" (如果还没点过)
+        if (!popupStatus.cookie) {
+          try {
+            const agreeBtn = this.page.locator('button:text("Agree")').first();
+            if (await agreeBtn.isVisible({ timeout: 100 })) {
+              await agreeBtn.click({ force: true });
+              this.logger.info(`[Browser] ✅ (1/3) 点击了 "Cookie Agree"`);
+              popupStatus.cookie = true;
+              clickedInThisLoop = true;
+            }
+          } catch (e) {}
+        }
+
+        // 2. 检查 "Got it" (如果还没点过)
+        if (!popupStatus.gotIt) {
+          try {
+            const gotItBtn = this.page
+              .locator('div.dialog button:text("Got it")')
+              .first();
+            if (await gotItBtn.isVisible({ timeout: 100 })) {
+              await gotItBtn.click({ force: true });
+              this.logger.info(`[Browser] ✅ (2/3) 点击了 "Got it" 弹窗`);
+              popupStatus.gotIt = true;
+              clickedInThisLoop = true;
+            }
+          } catch (e) {}
+        }
+
+        // 3. 检查 新手引导 "Close" (如果还没点过)
+        if (!popupStatus.guide) {
+          try {
+            const closeBtn = this.page
+              .locator('button[aria-label="Close"]')
+              .first();
+            if (await closeBtn.isVisible({ timeout: 100 })) {
+              await closeBtn.click({ force: true });
+              this.logger.info(`[Browser] ✅ (3/3) 点击了 "新手引导关闭" 按钮`);
+              popupStatus.guide = true;
+              clickedInThisLoop = true;
+            }
+          } catch (e) {}
+        }
+
+        // 如果本轮点击了按钮，稍微等一下动画；如果没点，等待1秒避免死循环空转
+        await this.page.waitForTimeout(clickedInThisLoop ? 500 : 1000);
+      }
+
+      this.logger.info(
+        `[Browser] 弹窗检查结束 (耗时: ${Math.round(
+          (Date.now() - startTime) / 1000
+        )}s)，结果: ` +
+          `Cookie[${popupStatus.cookie ? "Ok" : "No"}], ` +
+          `GotIt[${popupStatus.gotIt ? "Ok" : "No"}], ` +
+          `Guide[${popupStatus.guide ? "Ok" : "No"}]`
+      );
+
+      this.logger.info(
+        `[Browser] 弹窗清理阶段结束，准备进入 Code 按钮点击流程。`
+      );
+
       await this.page.evaluate(() => {
         const overlays = document.querySelectorAll("div.cdk-overlay-backdrop");
         if (overlays.length > 0) {
@@ -378,61 +441,45 @@ class BrowserManager {
       });
 
       this.logger.info('[Browser] (步骤1/5) 准备点击 "Code" 按钮...');
-
-      // 等待按钮出现（但不死等它可点击，只等它存在于DOM中）
-      try {
-        await this.page.waitForSelector('button:has-text("Code")', { state: 'attached', timeout: 15000 });
-      } catch (e) {
-        this.logger.warn("等待 Code 按钮 DOM 出现超时，尝试直接点击...");
-      }
-
-      let codeClicked = false;
       for (let i = 1; i <= 5; i++) {
         try {
-          this.logger.info(`  [尝试 ${i}/5] 正在尝试点击 "Code" 按钮...`);
-
-          // --- 仅使用 Playwright 强制点击 ---
-          const codeBtn = this.page.locator('button:text("Code")').first();
-          if ((await codeBtn.count()) > 0) {
-              await codeBtn.click({ force: true, timeout: 5000 });
-              this.logger.info("  ✅ 'Code' 按钮点击成功！");
-              codeClicked = true;
-              break;
-          } else {
-              throw new Error("找不到 Code 按钮元素");
-          }
-        } catch (error) {
-          this.logger.warn(
-            `  [尝试 ${i}/5] 点击异常: ${error.message.split("\n")[0]}，正在清理环境重试...`
-          );
-          
-          // 失败处理：清理环境
+          this.logger.info(`  [尝试 ${i}/5] 清理遮罩层并点击...`);
           await this.page.evaluate(() => {
             document
-              .querySelectorAll(".cdk-overlay-backdrop, .cdk-overlay-container")
-              .forEach((e) => e.remove());
+              .querySelectorAll("div.cdk-overlay-backdrop")
+              .forEach((el) => el.remove());
           });
-          await this.page.waitForTimeout(1000);
+          await this.page.waitForTimeout(500);
 
+          await this.page
+            .locator('button:text("Code")')
+            .click({ timeout: 10000 });
+          this.logger.info("  ✅ 点击成功！");
+          break;
+        } catch (error) {
+          this.logger.warn(
+            `  [尝试 ${i}/5] 点击失败: ${error.message.split("\n")[0]}`
+          );
           if (i === 5) {
-            this.logger.error(
-              "❌ [严重错误] 前置检查已通过，但仍无法点击按钮，可能是 Google UI 变更。"
-            );
-            
-            // 尝试截图
+            // [新增截图] 在最终失败时保存截图
             try {
               const screenshotPath = path.join(
                 __dirname,
-                "debug_failure_ui.png"
+                "debug_screenshot_final.png"
               );
               await this.page.screenshot({
                 path: screenshotPath,
                 fullPage: true,
               });
-              this.logger.info(`📷 调试截图已保存: ${screenshotPath}`);
-            } catch (screenshotError) {}
-
-            throw new Error("UI 交互失败：找不到 Code 按钮。");
+              this.logger.info(
+                `[调试] 最终失败截图已保存到: ${screenshotPath}`
+              );
+            } catch (screenshotError) {
+              this.logger.error(
+                `[调试] 保存截图失败: ${screenshotError.message}`
+              );
+            }
+            throw new Error(`多次尝试后仍无法点击 "Code" 按钮，初始化失败。`);
           }
         }
       }
@@ -463,7 +510,7 @@ class BrowserManager {
       await this.page.waitForTimeout(250);
 
       this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
-      await editorContainerLocator.click({ force: true, timeout: 30000 });
+      await editorContainerLocator.click({ timeout: 30000 });
 
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
@@ -476,13 +523,43 @@ class BrowserManager {
       this.logger.info(
         '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
       );
-      await this.page.locator('button:text("Preview")').first().click({ force: true });
+      await this.page.locator('button:text("Preview")').click();
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
       this.currentAuthIndex = authIndex;
+      this._startBackgroundWakeup();
+      this.logger.info("[Browser] (后台任务) 🛡️ 监控进程已启动...");
+      await this.page.waitForTimeout(1000);
+      this.logger.info(
+        "[Browser] ⚡ 正在发送主动唤醒请求以触发 Launch 流程..."
+      );
+      try {
+        await this.page.evaluate(async () => {
+          try {
+            await fetch(
+              "https://generativelanguage.googleapis.com/v1beta/models?key=ActiveTrigger",
+              {
+                method: "GET",
+                headers: { "Content-Type": "application/json" },
+              }
+            );
+          } catch (e) {
+            console.log(
+              "[ProxyClient] 主动唤醒请求已发送 (预期内可能会失败，这很正常)"
+            );
+          }
+        });
+        this.logger.info("[Browser] ⚡ 主动唤醒请求已发送。");
+      } catch (e) {
+        this.logger.warn(
+          `[Browser] 主动唤醒请求发送异常 (不影响主流程): ${e.message}`
+        );
+      }
+
       this.logger.info("==================================================");
       this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
       this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
       this.logger.info("==================================================");
+      this._startBackgroundWakeup();
     } catch (error) {
       this.logger.error(
         `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
@@ -514,100 +591,220 @@ class BrowserManager {
     this.logger.info(
       `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
     );
-    
-// [这里是第三步的代码：切换账号后调用唤醒]
-    this._startBackgroundWakeup();
   }
 
-  // ===================================================================================
-  // [新增] 后台执行 APP 唤醒逻辑 (V4 最终版: 只要看见就点，消失即停)
-  // ===================================================================================
   async _startBackgroundWakeup() {
-    // 1. 绝对缓冲：等待 5 秒
-    await new Promise(r => setTimeout(r, 5000));
-    
-    // 安全检查
-    if (!this.page || this.page.isClosed()) return;
+    const currentPage = this.page;
+    await new Promise((r) => setTimeout(r, 1500));
+    if (!currentPage || currentPage.isClosed() || this.page !== currentPage)
+      return;
+    this.logger.info("[Browser] (后台任务) 🛡️ 网页保活监控已启动");
+    while (
+      currentPage &&
+      !currentPage.isClosed() &&
+      this.page === currentPage
+    ) {
+      try {
+        // --- [增强步骤 1] 强制唤醒页面 (解决不发请求不刷新的问题) ---
+        await currentPage.bringToFront().catch(() => {});
 
-    this.logger.info('[Browser] (后台任务) 开始执行唤醒检查 (点击即消失模式)...');
+        // 关键：在无头模式下，仅仅 bringToFront 可能不够，需要伪造鼠标移动来触发渲染帧
+        // 随机在一个无害区域轻微晃动鼠标
+        await currentPage.mouse.move(10, 10);
+        await currentPage.mouse.move(20, 20);
 
-    try {
-        // 先尝试清理一次干扰项
-        try {
-            const gotIt = this.page.locator('button:has-text("Got it")').first();
-            if (await gotIt.isVisible()) await gotIt.click({ force: true });
-            
-            await this.page.evaluate(() => {
-                document.querySelectorAll('.cdk-overlay-backdrop').forEach(el => el.remove());
-            });
-        } catch (e) {}
-
-        // 锁定目标：只要包含 "Launch" 的按钮 (不管它是 Launch! 还是 Launch)
-        const launchBtn = this.page.locator('button:has-text("Launch")').first();
-        
-        // 如果起手就看不到，直接收工
-        if (!await launchBtn.isVisible({ timeout: 3000 })) {
-            this.logger.info('[Browser] (后台任务) 未检测到 Launch 按钮，APP 可能已在运行。');
-            return; 
-        }
-
-        this.logger.warn('⚠️ [Browser] (后台任务) 发现 Launch 按钮，开始点击直到它消失...');
-        
-        let attempt = 0;
-        const maxAttempts = 50; 
-
-        while (attempt < maxAttempts) {
-            if (!this.page || this.page.isClosed()) break;
-
-            // 1. 每次循环最开始：检查按钮还在不在？
-            // 如果它已经消失了，立刻庆祝并退出
-            const isStillThere = await launchBtn.isVisible({ timeout: 200 });
-            if (!isStillThere) {
-                this.logger.info(`[Browser] ✅ 唤醒成功！按钮已消失 (共点击 ${attempt} 次)。`);
-                break;
-            }
-
-            // 2. 如果还在，就点它
-            attempt++;
-            try {
-                // 双重保险：每次点击前都顺手清理一下可能挡路的 "Got it"
-                const annoyingPopup = this.page.locator('button:has-text("Got it")').first();
-                if (await annoyingPopup.isVisible({ timeout: 50 })) {
-                    await annoyingPopup.click({ force: true });
+        // --- [增强步骤 2] 智能查找 (查找文本并向上锁定可交互父级) ---
+        const targetInfo = await currentPage.evaluate(() => {
+          // 1. 直接CSS定位
+          try {
+            const preciseCandidates = Array.from(
+              document.querySelectorAll(
+                ".interaction-modal p, .interaction-modal button"
+              )
+            );
+            for (const el of preciseCandidates) {
+              const text = (el.innerText || "").trim();
+              if (/Launch|rocket_launch/i.test(text)) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                  return {
+                    found: true,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    tagName: el.tagName,
+                    text: text.substring(0, 15),
+                    strategy: "precise_css", // 标记：这是通过精准CSS找到的
+                  };
                 }
-
-                // 正式点击
-                await launchBtn.click({ force: true, timeout: 500 });
-                
-                // 3. 这里的等待很关键：点完要给页面一点反应时间让按钮消失
-                // [修改] 等待时间改为 1000 毫秒 (1秒)，即每隔一秒检测一次
-                await this.page.waitForTimeout(1000); 
-
-            } catch (err) {
-                // 点击报错通常意味着点的一瞬间它消失了，或者被遮挡了
-                // 不管怎样，进入下一次循环的 isVisible 检查自会分晓
+              }
             }
-        }
+          } catch (e) {}
+          // 2. 扫描Y轴400-800范围刻意元素
+          const MIN_Y = 400;
+          const MAX_Y = 800;
 
-        if (attempt >= maxAttempts) {
-            // 如果到了 50 次还在，那可能是真的遇到硬茬了
-            this.logger.warn(`[Browser] ℹ️ 达到点击上限 (${maxAttempts}次)，按钮依然顽强存在？停止尝试。`);
-        }
+          // 辅助函数：判断元素是否可见且在区域内
+          const isValid = (rect) => {
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.top > MIN_Y &&
+              rect.top < MAX_Y
+            );
+          };
 
-        // 截图留证
-        try {
-            if (this.page && !this.page.isClosed()) {
-                const shotPath = path.join(os.tmpdir(), `debug_bg_final_${Date.now()}.png`);
-                await this.page.screenshot({ path: shotPath, fullPage: true });
-                this.logger.info(`📷 [Debug] 任务结束截图: ${shotPath}`);
+          // 扫描所有包含关键词的元素
+          const candidates = Array.from(
+            document.querySelectorAll("button, span, div, a, i")
+          );
+
+          for (const el of candidates) {
+            const text = (el.innerText || "").trim();
+            // 匹配 Launch 或 rocket_launch 图标名
+            if (!/Launch|rocket_launch/i.test(text)) continue;
+
+            let targetEl = el;
+            let rect = targetEl.getBoundingClientRect();
+
+            // [关键优化] 如果当前元素很小或是纯文本容器，尝试向上找 3 层父级
+            let parentDepth = 0;
+            while (parentDepth < 3 && targetEl.parentElement) {
+              if (
+                targetEl.tagName === "BUTTON" ||
+                targetEl.getAttribute("role") === "button"
+              ) {
+                break;
+              }
+              const parent = targetEl.parentElement;
+              const pRect = parent.getBoundingClientRect();
+              if (isValid(pRect)) {
+                targetEl = parent;
+                rect = pRect;
+              }
+              parentDepth++;
             }
-        } catch (e) {}
 
-    } catch (e) {
-        this.logger.warn('[Browser] (后台任务) 异常: ' + e.message);
+            // 最终检查
+            if (isValid(rect)) {
+              return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                tagName: targetEl.tagName,
+                text: text.substring(0, 15),
+                strategy: "fuzzy_scan", // 标记：这是通过模糊扫描找到的
+              };
+            }
+          }
+          return { found: false };
+        });
+
+        // --- [增强步骤 3] 执行操作 ---
+        if (targetInfo.found) {
+          this.noButtonCount = 0;
+          this.logger.info(
+            `[Browser] 🎯 锁定目标 [${targetInfo.tagName}] (策略: ${
+              targetInfo.strategy === "precise_css" ? "精准定位" : "模糊扫描"
+            })...`
+          );
+
+          // === 策略 A: 物理点击 (模拟真实鼠标) ===
+          // 1. 移动过去
+          await currentPage.mouse.move(targetInfo.x, targetInfo.y, {
+            steps: 5,
+          });
+          // 2. 悬停 (给 hover 样式一点反应时间)
+          await new Promise((r) => setTimeout(r, 300));
+          // 3. 按下
+          await currentPage.mouse.down();
+          // 4. 长按 (某些按钮防误触，需要按住一小会儿)
+          await new Promise((r) => setTimeout(r, 400));
+          // 5. 抬起
+          await currentPage.mouse.up();
+
+          this.logger.info(`[Browser] 🖱️ 物理点击已执行，验证结果...`);
+          // 等待 1.5 秒看效果
+          await new Promise((r) => setTimeout(r, 1500));
+
+          // === 策略 B: JS 补刀 (如果物理点击失败) ===
+          // 再次检查按钮是否还在原地
+          const isStillThere = await currentPage.evaluate(() => {
+            // 逻辑同上，简单检查
+            const allText = document.body.innerText;
+            // 简单粗暴检查页面可视区是否还有那个特定位置的文字
+            // 这里为了性能做简化：再次扫描元素
+            const els = Array.from(
+              document.querySelectorAll('button, span, div[role="button"]')
+            );
+            return els.some((el) => {
+              const r = el.getBoundingClientRect();
+              return (
+                /Launch|rocket_launch/i.test(el.innerText) &&
+                r.top > 400 &&
+                r.top < 800 &&
+                r.height > 0
+              );
+            });
+          });
+
+          if (isStillThere) {
+            this.logger.warn(
+              `[Browser] ⚠️ 物理点击似乎无效（按钮仍在），尝试 JS 强力点击...`
+            );
+
+            // 直接在浏览器内部触发 click 事件
+            await currentPage.evaluate(() => {
+              const MIN_Y = 400;
+              const MAX_Y = 800;
+              const candidates = Array.from(
+                document.querySelectorAll('button, span, div[role="button"]')
+              );
+              for (const el of candidates) {
+                const r = el.getBoundingClientRect();
+                if (
+                  /Launch|rocket_launch/i.test(el.innerText) &&
+                  r.top > MIN_Y &&
+                  r.top < MAX_Y
+                ) {
+                  // 尝试找到最近的 button 父级点击
+                  let target = el;
+                  if (target.closest("button"))
+                    target = target.closest("button");
+                  target.click(); // 原生 JS 点击
+                  console.log(
+                    "[ProxyClient] JS Click triggered on " + target.tagName
+                  );
+                  return true;
+                }
+              }
+            });
+            await new Promise((r) => setTimeout(r, 2000));
+          } else {
+            this.logger.info(`[Browser] ✅ 物理点击成功，按钮已消失。`);
+            await new Promise((r) => setTimeout(r, 60000));
+            this.noButtonCount = 21;
+          }
+        } else {
+          this.noButtonCount++;
+          // 5. [关键] 智能休眠逻辑 (支持被唤醒)
+          if (this.noButtonCount > 20) {
+            for (let i = 0; i < 30; i++) {
+              if (this.noButtonCount === 0) {
+                break;
+              }
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+          } else {
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+        }
+      } catch (e) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
     }
   }
 }
+
 // ===================================================================================
 // PROXY SERVER MODULE
 // ===================================================================================
@@ -615,15 +812,17 @@ class BrowserManager {
 class LoggingService {
   constructor(serviceName = "ProxyServer") {
     this.serviceName = serviceName;
-    this.logBuffer = []; 
-    this.maxBufferSize = 100; 
+    this.logBuffer = []; // 用于在内存中保存日志
+    this.maxBufferSize = 100; // 最多保存100条
   }
 
   _formatMessage(level, message) {
     const timestamp = new Date().toISOString();
     const formatted = `[${level}] ${timestamp} [${this.serviceName}] - ${message}`;
 
+    // 将格式化后的日志存入缓冲区
     this.logBuffer.push(formatted);
+    // 如果缓冲区超过最大长度，则从头部删除旧的日志
     if (this.logBuffer.length > this.maxBufferSize) {
       this.logBuffer.shift();
     }
@@ -700,14 +899,16 @@ class ConnectionRegistry extends EventEmitter {
     this.logger = logger;
     this.connections = new Set();
     this.messageQueues = new Map();
-    this.reconnectGraceTimer = null; 
+    this.reconnectGraceTimer = null; // 新增：用于缓冲期计时的定时器
   }
   addConnection(websocket, clientInfo) {
+    // --- 核心修改：当新连接建立时，清除可能存在的“断开”警报 ---
     if (this.reconnectGraceTimer) {
       clearTimeout(this.reconnectGraceTimer);
       this.reconnectGraceTimer = null;
       this.logger.info("[Server] 在缓冲期内检测到新连接，已取消断开处理。");
     }
+    // --- 修改结束 ---
 
     this.connections.add(websocket);
     this.logger.info(
@@ -727,15 +928,18 @@ class ConnectionRegistry extends EventEmitter {
     this.connections.delete(websocket);
     this.logger.warn("[Server] 内部WebSocket客户端连接断开。");
 
+    // --- 核心修改：不立即清理队列，而是启动一个缓冲期 ---
     this.logger.info("[Server] 启动5秒重连缓冲期...");
     this.reconnectGraceTimer = setTimeout(() => {
+      // 5秒后，如果没有新连接进来（即reconnectGraceTimer未被清除），则确认是真实断开
       this.logger.error(
         "[Server] 缓冲期结束，未检测到重连。确认连接丢失，正在清理所有待处理请求..."
       );
       this.messageQueues.forEach((queue) => queue.close());
       this.messageQueues.clear();
-      this.emit("connectionLost"); 
-    }, 5000); 
+      this.emit("connectionLost"); // 使用一个新的事件名，表示确认丢失
+    }, 5000); // 5秒的缓冲时间
+    // --- 修改结束 ---
 
     this.emit("connectionRemoved", websocket);
   }
@@ -752,6 +956,8 @@ class ConnectionRegistry extends EventEmitter {
       if (queue) {
         this._routeMessage(parsedMessage, queue);
       } else {
+        // 在缓冲期内，旧的请求队列可能仍然存在，但连接已经改变，这可能会导致找不到队列。
+        // 暂时只记录警告，避免因竞速条件而报错。
         this.logger.warn(`[Server] 收到未知或已过时请求ID的消息: ${requestId}`);
       }
     } catch (error) {
@@ -759,6 +965,7 @@ class ConnectionRegistry extends EventEmitter {
     }
   }
 
+  // 其他方法 (_routeMessage, hasActiveConnections, getFirstConnection,等) 保持不变...
   _routeMessage(message, queue) {
     const { event_type } = message;
     switch (event_type) {
@@ -809,12 +1016,12 @@ class RequestHandler {
     this.browserManager = browserManager;
     this.config = config;
     this.authSource = authSource;
+    this.maxRetries = this.config.maxRetries;
+    this.retryDelay = this.config.retryDelay;
+    this.failureCount = 0;
     this.usageCount = 0;
-    
-    // [修改] 新增并发控制状态
-    this.activeRequestCount = 0; 
-    this.pendingSwitch = false;  
     this.isAuthSwitching = false;
+    this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
   }
 
@@ -827,53 +1034,81 @@ class RequestHandler {
   }
 
   _getNextAuthIndex() {
-    const available = this.authSource.availableIndices; 
+    const available = this.authSource.availableIndices; // 使用新的 availableIndices
     if (available.length === 0) return null;
 
     const currentIndexInArray = available.indexOf(this.currentAuthIndex);
-    // 如果当前账号不在可用列表中，或者找不到，从第一个开始
+
     if (currentIndexInArray === -1) {
+      this.logger.warn(
+        `[Auth] 当前索引 ${this.currentAuthIndex} 不在可用列表中，将切换到第一个可用索引。`
+      );
       return available[0];
     }
+
     const nextIndexInArray = (currentIndexInArray + 1) % available.length;
     return available[nextIndexInArray];
   }
 
-  // [新增] 尝试执行挂起的切换任务
-  async _tryExecutePendingSwitch() {
-    if (this.pendingSwitch && this.activeRequestCount === 0 && !this.isAuthSwitching) {
-        this.logger.info(`[Auth] ⚡ 所有活跃请求已结束，开始执行挂起的账号切换...`);
-        try {
-            await this._switchToNextAuth();
-        } catch (err) {
-            this.logger.error(`[Auth] 挂起的账号切换任务失败: ${err.message}`);
-        } finally {
-            this.pendingSwitch = false; 
-        }
-    }
-  }
-
   async _switchToNextAuth() {
+    const available = this.authSource.availableIndices;
+
+    if (available.length === 0) {
+      throw new Error("没有可用的认证源，无法切换。");
+    }
+
     if (this.isAuthSwitching) {
-      this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
+      this.logger.info("🔄 [Auth] 正在切换/重启账号，跳过重复操作");
       return { success: false, reason: "Switch already in progress." };
     }
 
+    // --- 加锁！ ---
     this.isSystemBusy = true;
     this.isAuthSwitching = true;
 
     try {
+      // 单账号模式 - 执行原地重启 (Refresh)
+      if (available.length === 1) {
+        const singleIndex = available[0];
+        this.logger.info("==================================================");
+        this.logger.info(
+          `🔄 [Auth] 单账号模式：达到轮换阈值，正在执行原地重启...`
+        );
+        this.logger.info(`   • 目标账号: #${singleIndex}`);
+        this.logger.info("==================================================");
+
+        try {
+          // 强制重新加载当前账号的 Context
+          await this.browserManager.launchOrSwitchContext(singleIndex);
+
+          // 关键：重置计数器
+          this.failureCount = 0;
+          this.usageCount = 0;
+
+          this.logger.info(
+            `✅ [Auth] 单账号 #${singleIndex} 重启/刷新成功，使用计数已清零。`
+          );
+          return { success: true, newIndex: singleIndex };
+        } catch (error) {
+          this.logger.error(`❌ [Auth] 单账号重启失败: ${error.message}`);
+          throw error;
+        }
+      }
+
+      // 多账号模式 - 执行轮换 (Rotate)
+
       const previousAuthIndex = this.currentAuthIndex;
       const nextAuthIndex = this._getNextAuthIndex();
 
       this.logger.info("==================================================");
-      this.logger.info(`🔄 [Auth] 开始账号切换流程`);
+      this.logger.info(`🔄 [Auth] 多账号模式：开始账号切换流程`);
       this.logger.info(`   • 当前账号: #${previousAuthIndex}`);
       this.logger.info(`   • 目标账号: #${nextAuthIndex}`);
       this.logger.info("==================================================");
 
       try {
         await this.browserManager.switchAccount(nextAuthIndex);
+        this.failureCount = 0;
         this.usageCount = 0;
         this.logger.info(
           `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
@@ -889,8 +1124,9 @@ class RequestHandler {
         try {
           await this.browserManager.launchOrSwitchContext(previousAuthIndex);
           this.logger.info(`✅ [Auth] 成功回退到账号 #${previousAuthIndex}！`);
+          this.failureCount = 0;
           this.usageCount = 0;
-          this.logger.info("[Auth] 使用计数已在回退成功后重置为0。");
+          this.logger.info("[Auth] 失败和使用计数已在回退成功后重置为0。");
           return {
             success: false,
             fallback: true,
@@ -914,12 +1150,6 @@ class RequestHandler {
       this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
       return { success: false, reason: "Switch already in progress." };
     }
-    
-    // 如果是手动强切，虽然不强制等待 activeRequestCount 为 0，但给个警告
-    if (this.activeRequestCount > 0) {
-       this.logger.warn(`⚠️ [Auth] 正在强制切换账号，但当前仍有 ${this.activeRequestCount} 个请求正在处理中，可能会被中断。`);
-    }
-
     if (!this.authSource.availableIndices.includes(targetIndex)) {
       return {
         success: false,
@@ -932,8 +1162,8 @@ class RequestHandler {
     try {
       this.logger.info(`🔄 [Auth] 开始切换到指定账号 #${targetIndex}...`);
       await this.browserManager.switchAccount(targetIndex);
+      this.failureCount = 0;
       this.usageCount = 0;
-      this.pendingSwitch = false; // 手动切换成功后，清除可能存在的自动切换标记
       this.logger.info(
         `✅ [Auth] 成功切换到账号 #${this.currentAuthIndex}，计数已重置。`
       );
@@ -942,6 +1172,7 @@ class RequestHandler {
       this.logger.error(
         `❌ [Auth] 切换到指定账号 #${targetIndex} 失败: ${error.message}`
       );
+      // 对于指定切换，失败了就直接报错，不进行回退，让用户知道这个账号有问题
       throw error;
     } finally {
       this.isAuthSwitching = false;
@@ -950,57 +1181,68 @@ class RequestHandler {
   }
 
   async _handleRequestFailureAndSwitch(errorDetails, res) {
+    // 失败计数逻辑
+    if (this.config.failureThreshold > 0) {
+      this.failureCount++;
+      this.logger.warn(
+        `⚠️ [Auth] 请求失败 - 失败计数: ${this.failureCount}/${this.config.failureThreshold} (当前账号索引: ${this.currentAuthIndex})`
+      );
+    }
+
     const isImmediateSwitch = this.config.immediateSwitchStatusCodes.includes(
       errorDetails.status
     );
+    const isThresholdReached =
+      this.config.failureThreshold > 0 &&
+      this.failureCount >= this.config.failureThreshold;
 
-    if (isImmediateSwitch) {
-      this.logger.warn(
-        `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换账号...`
-      );
-
-      // [核心修改]：先给用户返回错误，不再让用户等待切换过程
-      const userMsg = `[System] 检测到上游服务限制 (Code ${errorDetails.status})，正在自动切换账号，请稍后重试。`;
-
-      if (res && !res.headersSent) {
-          this.logger.info(`[Auth] ⚡ 在切换前立即响应客户端请求...`);
-          // 使用 503 Service Unavailable，因为我们正在维护(切换)中
-          this._sendErrorResponse(res, 503, userMsg);
-          if (!res.writableEnded) res.end();
-      } else if (res && !res.writableEnded) {
-          // 如果是流式中间断开，尝试发个 chunk
-           this._sendErrorChunkToClient(res, userMsg);
-           res.end();
+    // 只要满足任一切换条件
+    if (isImmediateSwitch || isThresholdReached) {
+      if (isImmediateSwitch) {
+        this.logger.warn(
+          `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换账号...`
+        );
+      } else {
+        this.logger.warn(
+          `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备切换账号...`
+        );
       }
 
-      // [核心修改]：响应发送完毕后，再并在后台执行切换
-      // 我们这里使用 await 来确保 isSystemBusy 状态的正确锁定，虽然对客户端来说响应已经结束了。
+      // [核心修改] 等待切换操作完成，并根据其结果发送不同消息
       try {
-        const result = await this._switchToNextAuth();
-        if (result.success) {
-             this.logger.info(`[Auth] ✅ 后台切换成功: 新账号 #${result.newIndex}`);
-        } else if (result.fallback) {
-             this.logger.info(`[Auth] 🔄 后台切换(回退)成功: 账号 #${this.currentAuthIndex}`);
-        }
+        await this._switchToNextAuth();
+        // 如果上面这行代码没有抛出错误，说明切换/回退成功了
+        const successMessage = `🔄 目标账户无效，已自动回退至账号 #${this.currentAuthIndex}。`;
+        this.logger.info(`[Auth] ${successMessage}`);
+        if (res) this._sendErrorChunkToClient(res, successMessage);
       } catch (error) {
-        this.logger.error(`[Auth] ❌ 后台切换失败: ${error.message}`);
+        let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
+
+        if (error.message.includes("Only one account is available")) {
+          // 场景：单账号无法切换
+          userMessage = "❌ 切换失败：只有一个可用账号。";
+          this.logger.info("[Auth] 只有一个可用账号，失败计数已重置。");
+          this.failureCount = 0;
+        } else if (error.message.includes("回退失败原因")) {
+          // 场景：切换到坏账号后，连回退都失败了
+          userMessage = `❌ 致命错误：自动切换和紧急回退均失败，服务可能已中断，请检查日志！`;
+        } else if (error.message.includes("切换到账号")) {
+          // 场景：切换到坏账号后，成功回退（这是一个伪“成功”，本质是上一个操作失败了）
+          userMessage = `⚠️ 自动切换失败：已自动回退到账号 #${this.currentAuthIndex}，请检查目标账号是否存在问题。`;
+        }
+
+        this.logger.error(`[Auth] 后台账号切换任务最终失败: ${error.message}`);
+        if (res) this._sendErrorChunkToClient(res, userMessage);
       }
-      return true; // 表示已处理了错误和响应
+
+      return;
     }
-    return false; // 表示未触发切换
   }
 
-  // [修改] Google 原生请求处理 (支持 graceful switch)
   async processRequest(req, res) {
-    // 1. 检查是否正在等待切换，如果是，拒绝新请求以排空队列
-    if (this.pendingSwitch || this.isAuthSwitching) {
-         this.logger.warn("[System] 系统正在等待/进行账号切换，拒绝新请求以排空队列。");
-         return this._sendErrorResponse(res, 503, "Server is rotating accounts, please retry shortly.");
+    if (this.browserManager) {
+      this.browserManager.notifyUserActivity();
     }
-
-    // 2. 增加活跃计数
-    this.activeRequestCount++;
-
     const requestId = this._generateRequestId();
     res.on("close", () => {
       if (!res.writableEnded) {
@@ -1011,78 +1253,92 @@ class RequestHandler {
       }
     });
 
-    // 崩溃恢复逻辑
     if (!this.connectionRegistry.hasActiveConnections()) {
       if (this.isSystemBusy) {
-        this.activeRequestCount--; // 退出前减少计数
-        this.logger.warn("[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。");
-        return this._sendErrorResponse(res, 503, "服务器正在进行内部维护（账号切换/恢复），请稍后重试。");
+        this.logger.warn(
+          "[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。"
+        );
+        return this._sendErrorResponse(
+          res,
+          503,
+          "服务器正在进行内部维护（账号切换/恢复），请稍后重试。"
+        );
       }
 
-      this.logger.error("❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复...");
+      this.logger.error(
+        "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复..."
+      );
+      // --- 开始恢复前，加锁！ ---
       this.isSystemBusy = true;
       try {
         await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
         this.logger.info(`✅ [System] 浏览器已成功恢复！`);
       } catch (error) {
-        this.activeRequestCount--; // 退出前减少计数
-        this.isSystemBusy = false; // 恢复失败也要解除 busy
         this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
-        return this._sendErrorResponse(res, 503, "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。");
+        return this._sendErrorResponse(
+          res,
+          503,
+          "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。"
+        );
       } finally {
+        // --- 恢复结束后，解锁！ ---
         this.isSystemBusy = false;
       }
     }
 
     if (this.isSystemBusy) {
-      this.activeRequestCount--;
-      this.logger.warn("[System] 收到新请求，但系统正在进行切换/恢复，拒绝新请求。");
-      return this._sendErrorResponse(res, 503, "服务器正在进行内部维护（账号切换/恢复），请稍后重试。");
+      this.logger.warn(
+        "[System] 收到新请求，但系统正在进行切换/恢复，拒绝新请求。"
+      );
+      return this._sendErrorResponse(
+        res,
+        503,
+        "服务器正在进行内部维护（账号切换/恢复），请稍后重试。"
+      );
     }
 
     const isGenerativeRequest =
       req.method === "POST" &&
       (req.path.includes("generateContent") ||
         req.path.includes("streamGenerateContent"));
-        
-    // [修改] 计数逻辑：只有在没挂起切换时才增加使用计数
-    if (this.config.switchOnUses > 0 && isGenerativeRequest && !this.pendingSwitch) {
+    if (this.config.switchOnUses > 0 && isGenerativeRequest) {
       this.usageCount++;
       this.logger.info(
         `[Request] 生成请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
       );
       if (this.usageCount >= this.config.switchOnUses) {
-        this.pendingSwitch = true; // 标记需要切换
-        this.logger.info(`[Auth] ⚠️ 达到轮换阈值，将在当前所有请求结束后自动切换账号。`);
+        this.needsSwitchingAfterRequest = true;
       }
     }
 
-    // [修正] 先构建 proxyRequest 对象
     const proxyRequest = this._buildProxyRequest(req, requestId);
-    
-    // [修正] 修改 proxyRequest 对象的 path，而不是修改只读的 req.path
-    if (this.serverSystem.redirect25to30 && proxyRequest.path && proxyRequest.path.includes("gemini-2.5-pro")) {
-         this.logger.info(`[Router] 检测到 gemini-2.5-pro，正在重定向到 gemini-3-pro-preview (Native)`);
-         proxyRequest.path = proxyRequest.path.replace("gemini-2.5-pro", "gemini-3-pro-preview");
-    }
-
     proxyRequest.is_generative = isGenerativeRequest;
+    // 根据判断结果，为浏览器脚本准备标志位
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
-    const wantsStreamByHeader = req.headers.accept && req.headers.accept.includes("text/event-stream");
+    const wantsStreamByHeader =
+      req.headers.accept && req.headers.accept.includes("text/event-stream");
     const wantsStreamByPath = req.path.includes(":streamGenerateContent");
     const wantsStream = wantsStreamByHeader || wantsStreamByPath;
 
     try {
       if (wantsStream) {
+        // --- 客户端想要流式响应 ---
         this.logger.info(
           `[Request] 客户端启用流式传输 (${this.serverSystem.streamingMode})，进入流式处理模式...`
         );
         if (this.serverSystem.streamingMode === "fake") {
-          await this._handlePseudoStreamResponse(proxyRequest, messageQueue, req, res);
+          await this._handlePseudoStreamResponse(
+            proxyRequest,
+            messageQueue,
+            req,
+            res
+          );
         } else {
           await this._handleRealStreamResponse(proxyRequest, messageQueue, res);
         }
       } else {
+        // --- 客户端想要非流式响应 ---
+        // 明确告知浏览器脚本本次应按“一次性JSON”（即fake模式）来处理
         proxyRequest.streaming_mode = "fake";
         await this._handleNonStreamResponse(proxyRequest, messageQueue, res);
       }
@@ -1090,86 +1346,75 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
-      
-      // [核心] 请求结束，减少活跃计数，并检查是否可以执行切换
-      this.activeRequestCount--;
-      if (this.activeRequestCount < 0) this.activeRequestCount = 0;
-      this._tryExecutePendingSwitch();
+      if (this.needsSwitchingAfterRequest) {
+        this.logger.info(
+          `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
+        );
+        this._switchToNextAuth().catch((err) => {
+          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+        });
+        this.needsSwitchingAfterRequest = false;
+      }
     }
   }
 
-  // [修改] OpenAI 请求处理 (支持 graceful switch)
   async processOpenAIRequest(req, res) {
-    // 1. 检查挂起状态
-    if (this.pendingSwitch || this.isAuthSwitching) {
-         return this._sendErrorResponse(res, 503, "Server is rotating accounts, please retry shortly.");
+    if (this.browserManager) {
+      this.browserManager.notifyUserActivity();
     }
-    
-    // 2. 增加活跃计数
-    this.activeRequestCount++;
-    
-    // 计数逻辑 (OpenAI 也要算)
-    if (this.config.switchOnUses > 0 && !this.pendingSwitch) {
-         this.usageCount++;
-         this.logger.info(`[Request] OpenAI请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses}`);
-         if (this.usageCount >= this.config.switchOnUses) {
-             this.pendingSwitch = true;
-             this.logger.info(`[Auth] ⚠️ 达到轮换阈值 (OpenAI)，将在请求结束后切换。`);
-         }
-    }
-
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
-    let model = req.body.model || "gemini-1.5-pro-latest";
-    
-    // [新增] 处理 OpenAI 请求的 2.5 -> 3.0 重定向 (操作本地变量 model 是安全的)
-    if (this.serverSystem.redirect25to30 && model === "gemini-2.5-pro") {
-        this.logger.info(`[Adapter] 检测到 gemini-2.5-pro，正在重定向到 gemini-3-pro-preview (OpenAI)`);
-        model = "gemini-3-pro-preview";
+    const model = req.body.model || "gemini-1.5-pro-latest";
+    const systemStreamMode = this.serverSystem.streamingMode;
+    const useRealStream = isOpenAIStream && systemStreamMode === "real";
+
+    if (this.config.switchOnUses > 0) {
+      this.usageCount++;
+      this.logger.info(
+        `[Request] OpenAI生成请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
+      );
+      if (this.usageCount >= this.config.switchOnUses) {
+        this.needsSwitchingAfterRequest = true;
+      }
     }
 
     let googleBody;
     try {
       googleBody = this._translateOpenAIToGoogle(req.body, model);
     } catch (error) {
-      this.activeRequestCount--; // 错误返回前减少计数
       this.logger.error(`[Adapter] OpenAI请求翻译失败: ${error.message}`);
-      return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.");
+      return this._sendErrorResponse(
+        res,
+        400,
+        "Invalid OpenAI request format."
+      );
     }
 
-    const googleEndpoint = isOpenAIStream
+    const googleEndpoint = useRealStream
       ? "streamGenerateContent"
       : "generateContent";
     const proxyRequest = {
       path: `/v1beta/models/${model}:${googleEndpoint}`,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      query_params: isOpenAIStream ? { alt: "sse" } : {},
+      query_params: useRealStream ? { alt: "sse" } : {},
       body: JSON.stringify(googleBody),
       request_id: requestId,
       is_generative: true,
-      streaming_mode: "real",
-      client_wants_stream: true,
-      resume_on_prohibit: this.serverSystem.enableResume,
-      resume_limit: this.serverSystem.resumeLimit 
+      streaming_mode: useRealStream ? "real" : "fake",
     };
 
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
       this._forwardRequest(proxyRequest);
-      const initialMessage = await messageQueue.dequeue(); 
+      const initialMessage = await messageQueue.dequeue();
 
       if (initialMessage.event_type === "error") {
         this.logger.error(
           `[Adapter] 收到来自浏览器的错误，将触发切换逻辑。状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`
         );
-
-        // [修改] 传递 res 以便立即响应
-        const handled = await this._handleRequestFailureAndSwitch(initialMessage, res);
-        
-        if (handled) return; // 如果已处理切换，直接返回，不再发送多余错误
-
+        await this._handleRequestFailureAndSwitch(initialMessage, res);
         if (isOpenAIStream) {
           if (!res.writableEnded) {
             res.write("data: [DONE]\n\n");
@@ -1182,10 +1427,15 @@ class RequestHandler {
             initialMessage.message
           );
         }
-        return; 
+        return;
       }
-      
-      let capturedFinishReason = "UNKNOWN";
+
+      if (this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] OpenAI接口请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+        this.failureCount = 0;
+      }
 
       if (isOpenAIStream) {
         res.status(200).set({
@@ -1194,45 +1444,68 @@ class RequestHandler {
           Connection: "keep-alive",
         });
 
-        let lastGoogleChunk = "";
-        while (true) {
-          const message = await messageQueue.dequeue(300000); 
-          if (message.type === "STREAM_END") {
-            res.write("data: [DONE]\n\n");
-            break;
-          }
-          if (message.data) {
-            const match = message.data.match(/"finishReason"\s*:\s*"([^"]+)"/);
-            if (match && match[1]) {
-                capturedFinishReason = match[1];
-            }
+        if (useRealStream) {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Real Mode) 已启动...`);
+          let lastGoogleChunk = "";
+          const streamState = { inThought: false };
 
-            const translatedChunk = this._translateGoogleToOpenAIStream(
-              message.data,
-              model
-            );
-            if (translatedChunk) {
-              res.write(translatedChunk);
+          while (true) {
+            const message = await messageQueue.dequeue(300000); // 5分钟超时
+            if (message.type === "STREAM_END") {
+              if (streamState.inThought) {
+                const closeThoughtPayload = {
+                  id: `chatcmpl-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: "\n</think>\n" },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                res.write(`data: ${JSON.stringify(closeThoughtPayload)}\n\n`);
+              }
+              res.write("data: [DONE]\n\n");
+              break;
             }
-            lastGoogleChunk = message.data; 
+            if (message.data) {
+              // [修改] 将 streamState 传递给翻译函数
+              const translatedChunk = this._translateGoogleToOpenAIStream(
+                message.data,
+                model,
+                streamState
+              );
+              if (translatedChunk) {
+                res.write(translatedChunk);
+              }
+              lastGoogleChunk = message.data;
+            }
           }
-        }
+        } else {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Fake Mode) 已启动...`);
 
-        try {
-          if (capturedFinishReason === "UNKNOWN" && lastGoogleChunk.startsWith("data: ")) {
-            const jsonString = lastGoogleChunk.substring(6).trim();
-            if (jsonString) {
-              const lastResponse = JSON.parse(jsonString);
-              capturedFinishReason = lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
-            }
+          let fullBody = "";
+          while (true) {
+            const message = await messageQueue.dequeue(300000);
+            if (message.type === "STREAM_END") break;
+            if (message.data) fullBody += message.data;
           }
-        } catch (e) {
+
+          const translatedChunk = this._translateGoogleToOpenAIStream(
+            fullBody,
+            model
+          );
+          if (translatedChunk) {
+            res.write(translatedChunk);
+          }
+          res.write("data: [DONE]\n\n");
+          this.logger.info(
+            `[Adapter] Fake模式：已一次性发送完整内容并结束流。`
+          );
         }
-        
-        this.logger.info(
-            `✅ [Request] OpenAI流式响应结束，原因: ${capturedFinishReason}，请求ID: ${requestId}`
-        );
-        
       } else {
         let fullBody = "";
         while (true) {
@@ -1249,24 +1522,39 @@ class RequestHandler {
         const candidate = googleResponse.candidates?.[0];
 
         let responseContent = "";
-        let responseReasoning = ""; 
-
         if (
           candidate &&
           candidate.content &&
           Array.isArray(candidate.content.parts)
         ) {
-          candidate.content.parts.forEach(p => {
-            if (p.inlineData) {
-                const image = p.inlineData;
-                responseContent += `![Generated Image](data:${image.mimeType};base64,${image.data})\n`;
-                this.logger.info("[Adapter] 从 parts.inlineData 中成功解析到图片。");
-            } else if (p.thought) {
-                responseReasoning += (p.text || "");
-            } else {
-                responseContent += (p.text || ""); 
+          const imagePart = candidate.content.parts.find((p) => p.inlineData);
+          if (imagePart) {
+            const image = imagePart.inlineData;
+            responseContent = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+            this.logger.info(
+              "[Adapter] 从 parts.inlineData 中成功解析到图片。"
+            );
+          } else {
+            let mainContent = "";
+            let reasoningContent = "";
+
+            candidate.content.parts.forEach((p) => {
+              if (p.thought) {
+                reasoningContent += p.text;
+              } else {
+                mainContent += p.text;
+              }
+            });
+
+            responseContent = mainContent;
+            var messageObj = {
+              role: "assistant",
+              content: responseContent,
+            };
+            if (reasoningContent) {
+              messageObj.reasoning_content = reasoningContent;
             }
-          });
+          }
         }
 
         const openaiResponse = {
@@ -1277,12 +1565,9 @@ class RequestHandler {
           choices: [
             {
               index: 0,
-              message: { 
-                  role: "assistant", 
-                  content: responseContent,
-                  reasoning_content: responseReasoning || null 
-              },
-              finish_reason: candidate?.finishReason || "UNKNOWN",
+              // 使用上面构建的 messageObj
+              message: messageObj || { role: "assistant", content: "" },
+              finish_reason: candidate?.finishReason,
             },
           ],
         };
@@ -1298,88 +1583,22 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
+      if (this.needsSwitchingAfterRequest) {
+        this.logger.info(
+          `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
+        );
+        this._switchToNextAuth().catch((err) => {
+          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+        });
+        this.needsSwitchingAfterRequest = false;
+      }
       if (!res.writableEnded) {
         res.end();
       }
-      
-      // [核心] 结束处理
-      this.activeRequestCount--;
-      if (this.activeRequestCount < 0) this.activeRequestCount = 0;
-      this._tryExecutePendingSwitch();
     }
   }
 
-// ... (Rest of RequestHandler methods: processModelListRequest, _cancelBrowserRequest, etc. - No changes) ...
-
-async processModelListRequest(req, res) {
-  const requestId = this._generateRequestId();
-  const proxyRequest = this._buildProxyRequest(req, requestId);
-
-  proxyRequest.path = "/v1beta/models";
-  proxyRequest.method = "GET";
-  proxyRequest.body = null;
-  proxyRequest.is_generative = false;
-  proxyRequest.streaming_mode = "fake";
-  proxyRequest.client_wants_stream = false;
-  proxyRequest.query_params = req.query;
-
-  this.logger.info(`[Adapter] 收到获取模型列表请求，正在转发至Google... (Request ID: ${requestId})`);
-  
-  const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
-
-  try {
-    this._forwardRequest(proxyRequest);
-    
-    const headerMessage = await messageQueue.dequeue();
-    if (headerMessage.event_type === "error") {
-      throw new Error(headerMessage.message || "Upstream error");
-    }
-
-    let fullBody = "";
-    while (true) {
-      const message = await messageQueue.dequeue(60000);
-      if (message.type === "STREAM_END") break;
-      if (message.event_type === "chunk" && message.data) {
-        fullBody += message.data;
-      }
-    }
-
-    let googleModels = [];
-    try {
-      const googleResponse = JSON.parse(fullBody);
-      googleModels = googleResponse.models || [];
-    } catch (e) {
-      this.logger.warn(`[Adapter] 解析模型列表JSON失败: ${e.message}`);
-    }
-    
-    const openaiModels = googleModels.map(model => {
-      const id = model.name.replace("models/", "");
-      return {
-        id: id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "google",
-        permission: [],
-        root: id,
-        parent: null
-      };
-    });
-
-    res.status(200).json({
-      object: "list",
-      data: openaiModels
-    });
-    
-    this.logger.info(`[Adapter] 成功获取并返回了 ${openaiModels.length} 个模型。`);
-
-  } catch (error) {
-    this.logger.error(`[Adapter] 获取模型列表失败: ${error.message}`);
-    this._sendErrorResponse(res, 500, "Failed to fetch model list.");
-  } finally {
-    this.connectionRegistry.removeMessageQueue(requestId);
-  }
-}
-
+  // --- 新增一个辅助方法，用于发送取消指令 ---
   _cancelBrowserRequest(requestId) {
     const connection = this.connectionRegistry.getFirstConnection();
     if (connection) {
@@ -1403,26 +1622,34 @@ async processModelListRequest(req, res) {
     return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   }
   _buildProxyRequest(req, requestId) {
-    let finalBody = req.body;
+    let bodyObj = req.body;
+    if (
+      this.serverSystem.forceThinking &&
+      req.method === "POST" &&
+      bodyObj &&
+      bodyObj.contents
+    ) {
+      if (!bodyObj.generationConfig) {
+        bodyObj.generationConfig = {};
+      }
 
-    if (this.serverSystem.enableNativeReasoning && 
-       (req.path.includes("generateContent") || req.path.includes("streamGenerateContent"))) {
-        try {
-            finalBody = JSON.parse(JSON.stringify(req.body));
-            if (!finalBody.generationConfig) {
-                finalBody.generationConfig = {};
-            }
-            finalBody.generationConfig.thinkingConfig = { includeThoughts: true };
-            this.logger.debug(`[Request] 已为请求 ${requestId} 强制注入 Native Thinking Config。`);
-        } catch(e) {
-            this.logger.warn(`[Request] 尝试注入 Native Thinking Config 失败: ${e.message}`);
-        }
+      if (!bodyObj.generationConfig.thinkingConfig) {
+        this.logger.info(
+          `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...`
+        );
+        bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
+      } else {
+        this.logger.info(
+          `[Proxy] ✅ (Google原生格式) 检测到客户端自带推理配置，跳过强制注入。`
+        );
+      }
     }
 
     let requestBody = "";
-    if (finalBody) {
-      requestBody = JSON.stringify(finalBody);
+    if (bodyObj) {
+      requestBody = JSON.stringify(bodyObj);
     }
+
     return {
       path: req.path,
       method: req.method,
@@ -1431,8 +1658,6 @@ async processModelListRequest(req, res) {
       body: requestBody,
       request_id: requestId,
       streaming_mode: this.serverSystem.streamingMode,
-      resume_on_prohibit: this.serverSystem.enableResume,
-      resume_limit: this.serverSystem.resumeLimit
     };
   }
   _forwardRequest(proxyRequest) {
@@ -1472,60 +1697,96 @@ async processModelListRequest(req, res) {
     }, 3000);
 
     try {
-      let lastMessage;
+      let lastMessage,
+        requestFailed = false;
 
-      // [修改] 移除循环重试逻辑，仅执行一次
-      this._forwardRequest(proxyRequest);
-      
-      try {
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error("Response from browser timed out after 300 seconds")
-              ),
-            300000
-          )
-        );
-        lastMessage = await Promise.race([
-          messageQueue.dequeue(),
-          timeoutPromise,
-        ]);
-      } catch (timeoutError) {
-        this.logger.error(`[Request] 致命错误: ${timeoutError.message}`);
-        lastMessage = {
-          event_type: "error",
-          status: 504,
-          message: timeoutError.message,
-        };
+      // 我们的重试循环（即使只跑一次）
+      for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+        if (attempt > 1) {
+          this.logger.info(
+            `[Request] 请求尝试 #${attempt}/${this.maxRetries}...`
+          );
+        }
+        this._forwardRequest(proxyRequest);
+        try {
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error("Response from browser timed out after 300 seconds")
+                ),
+              300000
+            )
+          );
+          lastMessage = await Promise.race([
+            messageQueue.dequeue(),
+            timeoutPromise,
+          ]);
+        } catch (timeoutError) {
+          this.logger.error(`[Request] 致命错误: ${timeoutError.message}`);
+          lastMessage = {
+            event_type: "error",
+            status: 504,
+            message: timeoutError.message,
+          };
+        }
+
+        if (lastMessage.event_type === "error") {
+          // --- 核心修改：在这里就区分，避免打印不必要的“失败”日志 ---
+          if (
+            !(
+              lastMessage.message &&
+              lastMessage.message.includes("The user aborted a request")
+            )
+          ) {
+            // 只有在不是“用户取消”的情况下，才打印“尝试失败”的警告
+            this.logger.warn(
+              `[Request] 尝试 #${attempt} 失败: 收到 ${
+                lastMessage.status || "未知"
+              } 错误。 - ${lastMessage.message}`
+            );
+          }
+
+          if (attempt < this.maxRetries) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, this.retryDelay)
+            );
+            continue;
+          }
+          requestFailed = true;
+        }
+        break;
       }
 
-      if (lastMessage.event_type === "error") {
+      // 处理最终结果
+      if (requestFailed) {
         if (
           lastMessage.message &&
           lastMessage.message.includes("The user aborted a request")
         ) {
           this.logger.info(
-            `[Request] 请求 #${proxyRequest.request_id} 已由用户妥善取消。`
+            `[Request] 请求 #${proxyRequest.request_id} 已由用户妥善取消，不计入失败统计。`
           );
         } else {
           this.logger.error(
-            `[Request] 请求失败，浏览器端返回错误: ${lastMessage.message}`
+            `[Request] 所有 ${this.maxRetries} 次重试均失败，将计入失败统计。`
           );
-          
-          // [修改] 传递 res
-          const handled = await this._handleRequestFailureAndSwitch(lastMessage, res);
-          
-          if (!handled) {
-            this._sendErrorChunkToClient(
-                res,
-                `请求失败: ${lastMessage.message}`
-            );
-          }
+          await this._handleRequestFailureAndSwitch(lastMessage, res);
+          this._sendErrorChunkToClient(
+            res,
+            `请求最终失败: ${lastMessage.message}`
+          );
         }
         return;
       }
 
+      // 成功的逻辑
+      if (proxyRequest.is_generative && this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] 生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+        this.failureCount = 0;
+      }
       const dataMessage = await messageQueue.dequeue();
       const endMessage = await messageQueue.dequeue();
       if (dataMessage.data) {
@@ -1570,12 +1831,8 @@ async processModelListRequest(req, res) {
           `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消，不计入失败统计。`
         );
       } else {
-        this.logger.error(`[Request] 请求失败。`);
-        
-        // [修改] 传递 res，处理失败直接返回
-        const handled = await this._handleRequestFailureAndSwitch(headerMessage, res);
-        if (handled) return;
-
+        this.logger.error(`[Request] 请求失败，将计入失败统计。`);
+        await this._handleRequestFailureAndSwitch(headerMessage, null);
         return this._sendErrorResponse(
           res,
           headerMessage.status,
@@ -1586,12 +1843,17 @@ async processModelListRequest(req, res) {
       return;
     }
 
-    this._setResponseHeaders(res, headerMessage, true); 
-    
-    this.logger.info("[Request] 开始流式传输...");
-    
-    let capturedFinishReason = "UNKNOWN"; 
+    // --- 核心修改：只有在生成请求成功时，才重置失败计数 ---
+    if (proxyRequest.is_generative && this.failureCount > 0) {
+      this.logger.info(
+        `✅ [Auth] 生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+      );
+      this.failureCount = 0;
+    }
+    // --- 修改结束 ---
 
+    this._setResponseHeaders(res, headerMessage);
+    this.logger.info("[Request] 开始流式传输...");
     try {
       let lastChunk = "";
       while (true) {
@@ -1602,29 +1864,22 @@ async processModelListRequest(req, res) {
         }
         if (dataMessage.data) {
           res.write(dataMessage.data);
-          
-          const match = dataMessage.data.match(/"finishReason"\s*:\s*"([^"]+)"/);
-          if (match && match[1]) {
-              capturedFinishReason = match[1];
-          }
-          
           lastChunk = dataMessage.data;
         }
       }
       try {
-        if (capturedFinishReason === "UNKNOWN" && lastChunk.startsWith("data: ")) {
+        if (lastChunk.startsWith("data: ")) {
           const jsonString = lastChunk.substring(6).trim();
           if (jsonString) {
             const lastResponse = JSON.parse(jsonString);
-            capturedFinishReason = lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+            const finishReason =
+              lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
+            this.logger.info(
+              `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
+            );
           }
         }
       } catch (e) {}
-      
-      this.logger.info(
-        `✅ [Request] 响应结束，原因: ${capturedFinishReason}，请求ID: ${proxyRequest.request_id}`
-      );
-      
     } catch (error) {
       if (error.message !== "Queue timeout") throw error;
       this.logger.warn("[Request] 真流式响应超时，可能流已正常结束。");
@@ -1639,11 +1894,14 @@ async processModelListRequest(req, res) {
   async _handleNonStreamResponse(proxyRequest, messageQueue, res) {
     this.logger.info(`[Request] 进入非流式处理模式...`);
 
+    // 转发请求到浏览器端
     this._forwardRequest(proxyRequest);
 
     try {
+      // 1. 等待响应头信息
       const headerMessage = await messageQueue.dequeue();
       if (headerMessage.event_type === "error") {
+        // ... (错误处理逻辑保持不变)
         if (headerMessage.message?.includes("The user aborted a request")) {
           this.logger.info(
             `[Request] 请求 #${proxyRequest.request_id} 已被用户妥善取消。`
@@ -1652,10 +1910,7 @@ async processModelListRequest(req, res) {
           this.logger.error(
             `[Request] 浏览器端返回错误: ${headerMessage.message}`
           );
-          
-          // [修改] 传递 res
-          const handled = await this._handleRequestFailureAndSwitch(headerMessage, res);
-          if (handled) return;
+          await this._handleRequestFailureAndSwitch(headerMessage, null);
         }
         return this._sendErrorResponse(
           res,
@@ -1664,6 +1919,7 @@ async processModelListRequest(req, res) {
         );
       }
 
+      // 2. 准备一个缓冲区，并确保循环等待直到收到结束信号
       let fullBody = "";
       while (true) {
         const message = await messageQueue.dequeue(300000);
@@ -1676,6 +1932,15 @@ async processModelListRequest(req, res) {
         }
       }
 
+      // 3. 重置失败计数器（如果需要）
+      if (proxyRequest.is_generative && this.failureCount > 0) {
+        this.logger.info(
+          `✅ [Auth] 非流式生成请求成功 - 失败计数已从 ${this.failureCount} 重置为 0`
+        );
+        this.failureCount = 0;
+      }
+
+      // [核心修正] 对Google原生格式的响应进行智能图片处理
       try {
         let parsedBody = JSON.parse(fullBody);
         let needsReserialization = false;
@@ -1693,22 +1958,25 @@ async processModelListRequest(req, res) {
             const imagePart = candidate.content.parts[imagePartIndex];
             const image = imagePart.inlineData;
 
+            // 创建一个新的 text part 来替换原来的 inlineData part
             const markdownTextPart = {
               text: `![Generated Image](data:${image.mimeType};base64,${image.data})`,
             };
 
+            // 替换掉原来的部分
             candidate.content.parts[imagePartIndex] = markdownTextPart;
             needsReserialization = true;
           }
         }
 
         if (needsReserialization) {
-          fullBody = JSON.stringify(parsedBody); 
+          fullBody = JSON.stringify(parsedBody); // 如果处理了图片，重新序列化
         }
       } catch (e) {
         this.logger.warn(
           `[Proxy] 响应体不是有效的JSON，或在处理图片时出错: ${e.message}`
         );
+        // 如果出错，则什么都不做，直接发送原始的 fullBody
       }
 
       try {
@@ -1720,6 +1988,7 @@ async processModelListRequest(req, res) {
         );
       } catch (e) {}
 
+      // 4. 设置正确的JSON响应头，并一次性发送处理过的全部数据
       res
         .status(headerMessage.status || 200)
         .type("application/json")
@@ -1761,22 +2030,13 @@ async processModelListRequest(req, res) {
     return "data: {}\n\n";
   }
 
-  _setResponseHeaders(res, headerMessage, isStream = false) {
+  _setResponseHeaders(res, headerMessage) {
     res.status(headerMessage.status || 200);
     const headers = headerMessage.headers || {};
     Object.entries(headers).forEach(([name, value]) => {
-      if (name.toLowerCase() === "content-length") return;
-      if (isStream && name.toLowerCase() === "content-type") return;
-      res.set(name, value);
+      if (name.toLowerCase() !== "content-length") res.set(name, value);
     });
-
-    if (isStream) {
-        res.set("Content-Type", "text/event-stream");
-        res.set("Cache-Control", "no-cache");
-        res.set("Connection", "keep-alive");
-    }
   }
-  
   _handleRequestError(error, res) {
     if (res.headersSent) {
       this.logger.error(`[Request] 请求处理错误 (头已发送): ${error.message}`);
@@ -1792,13 +2052,15 @@ async processModelListRequest(req, res) {
 
   _sendErrorResponse(res, status, message) {
     if (!res.headersSent) {
+      // 1. 创建一个符合API规范的JSON错误对象
       const errorPayload = {
         error: {
           code: status || 500,
           message: message,
-          status: "SERVICE_UNAVAILABLE",
+          status: "SERVICE_UNAVAILABLE", // 这是一个示例状态名
         },
       };
+      // 2. 设置响应类型为 application/json 并发送
       res
         .status(status || 500)
         .type("application/json")
@@ -1812,30 +2074,38 @@ async processModelListRequest(req, res) {
     let systemInstruction = null;
     const googleContents = [];
 
+    // 1. 分离出 system 指令
     const systemMessages = openaiBody.messages.filter(
       (msg) => msg.role === "system"
     );
     if (systemMessages.length > 0) {
+      // 将所有 system message 的内容合并
       const systemContent = systemMessages.map((msg) => msg.content).join("\n");
       systemInstruction = {
+        // Google Gemini 1.5 Pro 开始正式支持 system instruction
         role: "system",
         parts: [{ text: systemContent }],
       };
     }
 
+    // 2. 转换 user 和 assistant 消息
     const conversationMessages = openaiBody.messages.filter(
       (msg) => msg.role !== "system"
     );
     for (const message of conversationMessages) {
       const googleParts = [];
 
+      // [核心改进] 判断 content 是字符串还是数组
       if (typeof message.content === "string") {
+        // a. 如果是纯文本
         googleParts.push({ text: message.content });
       } else if (Array.isArray(message.content)) {
+        // b. 如果是图文混合内容
         for (const part of message.content) {
           if (part.type === "text") {
             googleParts.push({ text: part.text });
           } else if (part.type === "image_url" && part.image_url) {
+            // 从 data URL 中提取 mimetype 和 base64 数据
             const dataUrl = part.image_url.url;
             const match = dataUrl.match(/^data:(image\/.*?);base64,(.*)$/);
             if (match) {
@@ -1856,6 +2126,7 @@ async processModelListRequest(req, res) {
       });
     }
 
+    // 3. 构建最终的Google请求体
     const googleRequest = {
       contents: googleContents,
       ...(systemInstruction && {
@@ -1863,6 +2134,7 @@ async processModelListRequest(req, res) {
       }),
     };
 
+    // 4. 转换生成参数
     const generationConfig = {
       temperature: openaiBody.temperature,
       topP: openaiBody.top_p,
@@ -1870,14 +2142,70 @@ async processModelListRequest(req, res) {
       maxOutputTokens: openaiBody.max_tokens,
       stopSequences: openaiBody.stop,
     };
-    
-    if (this.serverSystem.enableReasoning) {
-        this.logger.info("[Adapter] 检测到推理模式已启用，正在注入 thinkingConfig...");
-        generationConfig.thinkingConfig = { includeThoughts: true };
+
+    const extraBody = openaiBody.extra_body || {};
+    let rawThinkingConfig =
+      extraBody.google?.thinking_config ||
+      extraBody.google?.thinkingConfig ||
+      extraBody.thinkingConfig ||
+      extraBody.thinking_config ||
+      openaiBody.thinkingConfig ||
+      openaiBody.thinking_config;
+
+    let thinkingConfig = null;
+
+    if (rawThinkingConfig) {
+      // 2. 格式清洗：将 snake_case (下划线) 转换为 camelCase (驼峰)
+      thinkingConfig = {};
+
+      // 处理开关
+      if (rawThinkingConfig.include_thoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.include_thoughts;
+      } else if (rawThinkingConfig.includeThoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
+      }
+
+      // 处理 Budget (预算)
+      // if (rawThinkingConfig.thinking_budget !== undefined) {
+      // thinkingConfig.thinkingBudgetTokenLimit =
+      // rawThinkingConfig.thinking_budget;
+      //} else if (rawThinkingConfig.thinkingBudget !== undefined) {
+      //thinkingConfig.thinkingBudgetTokenLimit =
+      //rawThinkingConfig.thinkingBudget;
+      //}
+
+      this.logger.info(
+        `[Adapter] 成功提取并转换推理配置: ${JSON.stringify(thinkingConfig)}`
+      );
     }
-    
+
+    // 3. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
+    if (!thinkingConfig) {
+      const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
+      if (effort) {
+        this.logger.info(
+          `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`
+        );
+        thinkingConfig = { includeThoughts: true };
+      }
+    }
+
+    // 4. 强制开启逻辑 (WebUI开关)
+    if (this.serverSystem.forceThinking && !thinkingConfig) {
+      this.logger.info(
+        "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig..."
+      );
+      thinkingConfig = { includeThoughts: true };
+    }
+
+    // 5. 写入最终配置
+    if (thinkingConfig) {
+      generationConfig.thinkingConfig = thinkingConfig;
+    }
+
     googleRequest.generationConfig = generationConfig;
 
+    // 5. 安全设置
     googleRequest.safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -1931,31 +2259,42 @@ async processModelListRequest(req, res) {
       return null;
     }
 
-    let content = "";
-    let reasoningContent = "";
+    const delta = {};
 
     if (candidate.content && Array.isArray(candidate.content.parts)) {
-      candidate.content.parts.forEach((p) => {
-        if (p.inlineData) {
-            const image = p.inlineData;
-            content += `![Generated Image](data:${image.mimeType};base64,${image.data})`;
-            this.logger.info("[Adapter] 从流式响应块中成功解析到图片。");
-        } else if (p.thought) {
-            reasoningContent += p.text || "";
-        } else {
-            content += p.text || "";
+      const imagePart = candidate.content.parts.find((p) => p.inlineData);
+
+      if (imagePart) {
+        const image = imagePart.inlineData;
+        delta.content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+        this.logger.info("[Adapter] 从流式响应块中成功解析到图片。");
+      } else {
+        // 遍历所有部分，分离思考内容和正文内容
+        let contentAccumulator = "";
+        let reasoningAccumulator = "";
+
+        for (const part of candidate.content.parts) {
+          // Google API 的 thought 标记
+          if (part.thought === true) {
+            reasoningAccumulator += part.text || "";
+          } else {
+            contentAccumulator += part.text || "";
+          }
         }
-      });
+
+        // 只有当有内容时才添加到 delta 中
+        if (reasoningAccumulator) {
+          delta.reasoning_content = reasoningAccumulator;
+        }
+        if (contentAccumulator) {
+          delta.content = contentAccumulator;
+        }
+      }
     }
 
-    const finishReason = candidate.finishReason;
-    const delta = {};
-    
-    if (content) delta.content = content;
-    if (reasoningContent) delta.reasoning_content = reasoningContent;
-
-    if (Object.keys(delta).length === 0 && !finishReason) {
-        return null;
+    // 如果没有任何内容变更，则不返回数据（避免空行）
+    if (!delta.content && !delta.reasoning_content && !candidate.finishReason) {
+      return null;
     }
 
     const openaiResponse = {
@@ -1966,8 +2305,8 @@ async processModelListRequest(req, res) {
       choices: [
         {
           index: 0,
-          delta: delta,
-          finish_reason: finishReason || null,
+          delta: delta, // 使用包含 reasoning_content 的 delta
+          finish_reason: candidate.finishReason || null,
         },
       ],
     };
@@ -1980,20 +2319,10 @@ class ProxyServerSystem extends EventEmitter {
   constructor() {
     super();
     this.logger = new LoggingService("ProxySystem");
-    this._loadConfiguration(); 
+    this._loadConfiguration(); // 这个函数会执行下面的_loadConfiguration
     this.streamingMode = this.config.streamingMode;
-    
-    // [新增] 默认为 false，用户可通过面板开启
-    this.enableReasoning = false; 
-    // [新增] 强制开启原生格式推理
-    this.enableNativeReasoning = false;
-    
-    // [新增] 续写开关和限制
-    this.enableResume = false; 
-    this.resumeLimit = 3; // 默认最大重试3次
 
-    // [新增] 2.5 Pro 到 3.0 Pro 重定向开关
-    this.redirect25to30 = false;
+    this.forceThinking = false;
 
     this.authSource = new AuthSource(this.logger);
     this.browserManager = new BrowserManager(
@@ -2015,28 +2344,53 @@ class ProxyServerSystem extends EventEmitter {
     this.wsServer = null;
   }
 
+  // ===== 所有函数都已正确放置在类内部 =====
+
   _loadConfiguration() {
-    // ... [Config loading logic unchanged] ...
     let config = {
       httpPort: 7860,
       host: "0.0.0.0",
       wsPort: 9998,
       streamingMode: "real",
+      failureThreshold: 3,
       switchOnUses: 40,
+      maxRetries: 1,
+      retryDelay: 2000,
       browserExecutablePath: null,
       apiKeys: [],
-      immediateSwitchStatusCodes: [401, 403, 429],
+      immediateSwitchStatusCodes: [429, 503],
+      // [新增] 用于追踪API密钥来源
       apiKeySource: "未设置",
     };
+
+    const configPath = path.join(__dirname, "config.json");
+    try {
+      if (fs.existsSync(configPath)) {
+        const fileConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        config = { ...config, ...fileConfig };
+        this.logger.info("[System] 已从 config.json 加载配置。");
+      }
+    } catch (error) {
+      this.logger.warn(`[System] 无法读取或解析 config.json: ${error.message}`);
+    }
 
     if (process.env.PORT)
       config.httpPort = parseInt(process.env.PORT, 10) || config.httpPort;
     if (process.env.HOST) config.host = process.env.HOST;
     if (process.env.STREAMING_MODE)
       config.streamingMode = process.env.STREAMING_MODE;
+    if (process.env.FAILURE_THRESHOLD)
+      config.failureThreshold =
+        parseInt(process.env.FAILURE_THRESHOLD, 10) || config.failureThreshold;
     if (process.env.SWITCH_ON_USES)
       config.switchOnUses =
         parseInt(process.env.SWITCH_ON_USES, 10) || config.switchOnUses;
+    if (process.env.MAX_RETRIES)
+      config.maxRetries =
+        parseInt(process.env.MAX_RETRIES, 10) || config.maxRetries;
+    if (process.env.RETRY_DELAY)
+      config.retryDelay =
+        parseInt(process.env.RETRY_DELAY, 10) || config.retryDelay;
     if (process.env.CAMOUFOX_EXECUTABLE_PATH)
       config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
     if (process.env.API_KEYS) {
@@ -2052,7 +2406,7 @@ class ProxyServerSystem extends EventEmitter {
       Array.isArray(config.immediateSwitchStatusCodes)
     ) {
       rawCodes = config.immediateSwitchStatusCodes.join(",");
-      codesSource = "系统默认值";
+      codesSource = "config.json 文件或默认值";
     }
 
     if (rawCodes && typeof rawCodes === "string") {
@@ -2075,6 +2429,7 @@ class ProxyServerSystem extends EventEmitter {
       config.apiKeys = [];
     }
 
+    // [修改] 更新API密钥来源的判断逻辑
     if (config.apiKeys.length > 0) {
       config.apiKeySource = "自定义";
     } else {
@@ -2082,9 +2437,30 @@ class ProxyServerSystem extends EventEmitter {
       config.apiKeySource = "默认";
       this.logger.info("[System] 未设置任何API Key，已启用默认密码: 123456");
     }
-    
+
+    const modelsPath = path.join(__dirname, "models.json");
+    try {
+      if (fs.existsSync(modelsPath)) {
+        const modelsFileContent = fs.readFileSync(modelsPath, "utf-8");
+        config.modelList = JSON.parse(modelsFileContent); // 将读取到的模型列表存入config对象
+        this.logger.info(
+          `[System] 已从 models.json 成功加载 ${config.modelList.length} 个模型。`
+        );
+      } else {
+        this.logger.warn(
+          `[System] 未找到 models.json 文件，将使用默认模型列表。`
+        );
+        config.modelList = ["gemini-1.5-pro-latest"]; // 提供一个备用模型，防止服务启动失败
+      }
+    } catch (error) {
+      this.logger.error(
+        `[System] 读取或解析 models.json 失败: ${error.message}，将使用默认模型列表。`
+      );
+      config.modelList = ["gemini-1.5-pro-latest"]; // 出错时也使用备用模型
+    }
+
     this.config = config;
-    this.logger.info("================[生效配置]================");
+    this.logger.info("================ [ 生效配置 ] ================");
     this.logger.info(`  HTTP 服务端口: ${this.config.httpPort}`);
     this.logger.info(`  监听地址: ${this.config.host}`);
     this.logger.info(`  流式模式: ${this.config.streamingMode}`);
@@ -2096,32 +2472,46 @@ class ProxyServerSystem extends EventEmitter {
       }`
     );
     this.logger.info(
+      `  失败计数切换: ${
+        this.config.failureThreshold > 0
+          ? `失败${this.config.failureThreshold} 次后切换`
+          : "已禁用"
+      }`
+    );
+    this.logger.info(
       `  立即切换报错码: ${
         this.config.immediateSwitchStatusCodes.length > 0
           ? this.config.immediateSwitchStatusCodes.join(", ")
           : "已禁用"
       }`
     );
-    this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); 
+    this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
+    this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
+    this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
     this.logger.info(
       "============================================================="
     );
   }
 
   async start(initialAuthIndex = null) {
-    // ... [Start logic unchanged] ...
+    // <<<--- 1. 重新接收参数
     this.logger.info("[System] 开始弹性启动流程...");
+    await this._startHttpServer();
+    await this._startWebSocketServer();
+    this.logger.info("[System] 准备加载浏览器...");
     const allAvailableIndices = this.authSource.availableIndices;
 
     if (allAvailableIndices.length === 0) {
       throw new Error("没有任何可用的认证源，无法启动。");
     }
 
+    // 2. <<<--- 创建一个优先尝试的启动顺序列表 --->>>
     let startupOrder = [...allAvailableIndices];
     if (initialAuthIndex && allAvailableIndices.includes(initialAuthIndex)) {
       this.logger.info(
         `[System] 检测到指定启动索引 #${initialAuthIndex}，将优先尝试。`
       );
+      // 将指定索引放到数组第一位，其他索引保持原状
       startupOrder = [
         initialAuthIndex,
         ...allAvailableIndices.filter((i) => i !== initialAuthIndex),
@@ -2140,6 +2530,7 @@ class ProxyServerSystem extends EventEmitter {
     }
 
     let isStarted = false;
+    // 3. <<<--- 遍历这个新的、可能被重排过的顺序列表 --->>>
     for (const index of startupOrder) {
       try {
         this.logger.info(`[System] 尝试使用账号 #${index} 启动服务...`);
@@ -2147,29 +2538,25 @@ class ProxyServerSystem extends EventEmitter {
 
         isStarted = true;
         this.logger.info(`[System] ✅ 使用账号 #${index} 成功启动！`);
-        break; 
+        break; // 成功启动，跳出循环
       } catch (error) {
         this.logger.error(
           `[System] ❌ 使用账号 #${index} 启动失败。原因: ${error.message}`
         );
+        // 失败了，循环将继续，尝试下一个账号
       }
     }
 
     if (!isStarted) {
+      // 如果所有账号都尝试失败了
       throw new Error("所有认证源均尝试失败，服务器无法启动。");
     }
-
-    await this._startHttpServer();
-    await this._startWebSocketServer();
     this.logger.info(`[System] 代理服务器系统启动完成。`);
-    // [新增] 系统完全启动后，在后台执行唤醒检测，确保 WebSocket 已就绪
-    this.browserManager._startBackgroundWakeup();
     this.emit("started");
   }
 
   _createAuthMiddleware() {
-     // ... [Auth middleware unchanged] ...
-    const basicAuth = require("basic-auth"); 
+    const basicAuth = require("basic-auth"); // 确保此行存在，为admin认证提供支持
 
     return (req, res, next) => {
       const serverApiKeys = this.config.apiKeys;
@@ -2192,12 +2579,19 @@ class ProxyServerSystem extends EventEmitter {
       }
 
       if (clientKey && serverApiKeys.includes(clientKey)) {
+        this.logger.info(
+          `[Auth] API Key验证通过 (来自: ${
+            req.headers["x-forwarded-for"] || req.ip
+          })`
+        );
         if (req.query.key) {
           delete req.query.key;
         }
         return next();
       }
 
+      // 对于没有有效API Key的请求，返回401错误
+      // 注意：健康检查等逻辑已在_createExpressApp中提前处理
       if (req.path !== "/favicon.ico") {
         const clientIp = req.headers["x-forwarded-for"] || req.ip;
         this.logger.warn(
@@ -2215,7 +2609,6 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   async _startHttpServer() {
-    // ... [Server creation unchanged] ...
     const app = this._createExpressApp();
     this.httpServer = http.createServer(app);
 
@@ -2274,6 +2667,7 @@ class ProxyServerSystem extends EventEmitter {
     app.use(express.urlencoded({ extended: true }));
 
     const sessionSecret =
+      // Section 1 & 2 (核心中间件和登录路由) 保持不变...
       (this.config.apiKeys && this.config.apiKeys[0]) ||
       crypto.randomBytes(20).toString("hex");
     app.use(cookieParser());
@@ -2291,95 +2685,20 @@ class ProxyServerSystem extends EventEmitter {
       }
       res.redirect("/login");
     };
-    // ... [Login HTML/Route unchanged] ...
     app.get("/login", (req, res) => {
-  if (req.session.isAuthenticated) {
-    return res.redirect("/");
-  }
-  const loginHtml = `
-  <!DOCTYPE html>
-  <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>系统登录</title>
-    <style>
-      :root { --primary-color: #007aff; --bg-color: #f2f2f7; }
-      body {
-        margin: 0; padding: 0;
-        height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background-color: var(--bg-color);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      if (req.session.isAuthenticated) {
+        return res.redirect("/");
       }
-      .login-card {
-        background: white;
-        padding: 40px 30px;
-        border-radius: 20px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.05);
-        width: 100%;
-        max-width: 380px;
-        text-align: center;
-      }
-      h2 { margin: 0 0 30px; color: #1c1c1e; font-weight: 600; }
-      .input-group { position: relative; margin-bottom: 20px; }
-      input {
-        width: 100%; box-sizing: border-box;
-        padding: 16px; padding-right: 50px;
-        border: 1px solid #e5e5ea;
-        border-radius: 12px;
-        font-size: 16px;
-        background: #f2f2f7;
-        outline: none; transition: all 0.2s;
-      }
-      input:focus { background: #fff; border-color: var(--primary-color); box-shadow: 0 0 0 2px rgba(0,122,255,0.1); }
-      .eye-btn {
-        position: absolute; right: 15px; top: 50%; transform: translateY(-50%);
-        cursor: pointer; color: #8e8e93; display: flex;
-      }
-      button {
-        width: 100%; padding: 16px;
-        background: var(--primary-color);
-        color: white; border: none; border-radius: 12px;
-        font-size: 16px; font-weight: 600;
-        cursor: pointer; transition: opacity 0.2s;
-      }
-      button:hover { opacity: 0.9; }
-      .error-msg {
-        color: #ff3b30; background: #fff2f2;
-        padding: 10px; border-radius: 8px; margin-top: 20px; font-size: 14px;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="login-card">
-      <form action="/login" method="post">
-        <h2>验证身份</h2>
-        <div class="input-group">
-            <input type="password" id="apiKeyInput" name="apiKey" placeholder="输入 API Key" required>
-            <div class="eye-btn" id="toggleBtn">
-                <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-            </div>
-        </div>
-        <button type="submit">登 录</button>
-        ${req.query.error ? '<div class="error-msg">API Key 无效</div>' : ""}
-      </form>
-    </div>
-    <script>
-      const input = document.getElementById('apiKeyInput');
-      const btn = document.getElementById('toggleBtn');
-      btn.onclick = () => {
-        const isPwd = input.type === 'password';
-        input.type = isPwd ? 'text' : 'password';
-        btn.style.color = isPwd ? '#007aff' : '#8e8e93';
-      }
-    </script>
-  </body>
-  </html>`;
-  res.send(loginHtml);
-});
+      const loginHtml = `
+      <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>登录</title>
+      <style>body{display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#f0f2f5}form{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);text-align:center}input{width:250px;padding:10px;margin-top:10px;border:1px solid #ccc;border-radius:5px}button{width:100%;padding:10px;background-color:#007bff;color:white;border:none;border-radius:5px;margin-top:20px;cursor:pointer}.error{color:red;margin-top:10px}</style>
+      </head><body><form action="/login" method="post"><h2>请输入 API Key</h2>
+      <input type="password" name="apiKey" placeholder="API Key" required autofocus><button type="submit">登录</button>
+      ${
+        req.query.error ? '<p class="error">API Key 错误!</p>' : ""
+      }</form></body></html>`;
+      res.send(loginHtml);
+    });
     app.post("/login", (req, res) => {
       const { apiKey } = req.body;
       if (apiKey && this.config.apiKeys.includes(apiKey)) {
@@ -2390,399 +2709,207 @@ class ProxyServerSystem extends EventEmitter {
       }
     });
 
+    // ==========================================================
+    // Section 3: 状态页面 和 API (最终版)
+    // ==========================================================
     app.get("/", isAuthenticated, (req, res) => {
+      const { config, requestHandler, authSource, browserManager } = this;
+      const initialIndices = authSource.initialIndices || [];
+      const availableIndices = authSource.availableIndices || [];
+      const invalidIndices = initialIndices.filter(
+        (i) => !availableIndices.includes(i)
+      );
+      const logs = this.logger.logBuffer || [];
+
+      const accountNameMap = authSource.accountNameMap;
+      const accountDetailsHtml = initialIndices
+        .map((index) => {
+          const isInvalid = invalidIndices.includes(index);
+          const name = isInvalid
+            ? "N/A (JSON格式错误)"
+            : accountNameMap.get(index) || "N/A (未命名)";
+          return `<span class="label" style="padding-left: 20px;">账号${index}</span>: ${name}`;
+        })
+        .join("\n");
+
+      const accountOptionsHtml = availableIndices
+        .map((index) => `<option value="${index}">账号 #${index}</option>`)
+        .join("");
+
       const statusHtml = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>代理控制台</title>
-    <style>
-        /* =========================================
-           1. 全局基础变量与组件
-           ========================================= */
-        :root {
-            --bg-color: #f4f6f9;
-            --card-bg: #ffffff;
-            --text-primary: #1c1e21;
-            --text-secondary: #606770;
-            --accent-color: #007aff;
-            --success-color: #34c759;
-            --border-color: #ebedf0;
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>代理服务状态</title>
+        <style>
+        body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background-color: #f0f2f5; color: #333; padding: 2em; }
+        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 1em 2em 2em 2em; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1, h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 0.5em;}
+        pre { background: #2d2d2d; color: #f0f0f0; font-size: 1.1em; padding: 1.5em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+        #log-container { font-size: 0.9em; max-height: 400px; overflow-y: auto; }
+        .status-ok { color: #2ecc71; font-weight: bold; }
+        .status-error { color: #e74c3c; font-weight: bold; }
+        .label { display: inline-block; width: 220px; box-sizing: border-box; }
+        .dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-left: 10px; animation: blink 1s infinite alternate; }
+        @keyframes blink { from { opacity: 0.3; } to { opacity: 1; } }
+        .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
+        .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
+        .action-group button:hover { opacity: 0.85; }
+        .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
+        .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
+        @media (max-width: 600px) {
+            body { padding: 0.5em; }
+            .container { padding: 1em; margin: 0; }
+            pre { padding: 1em; font-size: 0.9em; }
+            .label { width: auto; display: inline; }
+            .action-group { flex-direction: column; align-items: stretch; }
+            .action-group select, .action-group button { width: 100%; box-sizing: border-box; }
         }
-        
-        body { margin: 0; padding: 0; background: var(--bg-color); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--text-primary); }
-        * { box-sizing: border-box; }
-
-        /* 标题栏 */
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .header h1 { font-size: 24px; font-weight: 700; margin: 0; }
-        .status-badge { background: #e4e6eb; padding: 6px 12px; border-radius: 20px; font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; }
-        .status-dot.active { background: var(--success-color); box-shadow: 0 0 0 2px rgba(52, 199, 89, 0.2); }
-
-        /* 卡片通用样式 */
-        .card { background: var(--card-bg); border-radius: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); margin-bottom: 20px; overflow: hidden; display: flex; flex-direction: column; }
-        .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border-color); font-weight: 600; font-size: 16px; flex-shrink: 0; }
-        .card-body { padding: 0; }
-
-        /* 列表行样式 */
-        .row-item { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--border-color); }
-        .row-item:last-child { border-bottom: none; }
-        .row-label { font-size: 15px; color: var(--text-primary); }
-        .row-desc { font-size: 12px; color: var(--text-secondary); margin-top: 4px; max-width: 300px; line-height: 1.4; }
-        .row-value { font-family: 'SF Mono', Consolas, monospace; font-size: 14px; color: var(--text-secondary); }
-
-        /* 开关控件 */
-        .switch { position: relative; display: inline-block; width: 50px; height: 28px; flex-shrink: 0; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #e9e9ea; transition: .3s; border-radius: 34px; }
-        .slider:before { position: absolute; content: ""; height: 24px; width: 24px; left: 2px; bottom: 2px; background-color: white; transition: .3s; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-        input:checked + .slider { background-color: var(--accent-color); }
-        input:checked + .slider:before { transform: translateX(22px); }
-
-        /* 按钮与输入 */
-        .action-btn { background: var(--accent-color); color: white; border: none; padding: 8px 16px; border-radius: 8px; font-weight: 500; cursor: pointer; font-size: 14px; white-space: nowrap; transition: 0.2s; }
-        .action-btn:hover { opacity: 0.9; }
-        .num-input { width: 60px; padding: 6px; border: 1px solid #d1d1d6; border-radius: 6px; text-align: center; margin-right: 10px; }
-        
-        select { 
-            padding: 8px 30px 8px 12px; border-radius: 8px; border: 1px solid #d1d1d6; background: #fff; font-size: 14px; 
-            -webkit-appearance: none; 
-            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e"); 
-            background-repeat: no-repeat; background-position: right 8px center; background-size: 12px;
-        }
-
-        /* 日志区域基础 */
-        .log-container { 
-            background: #1e1e1e; color: #f0f0f0; padding: 15px; 
-            font-family: 'SF Mono', Consolas, monospace; line-height: 1.5; 
-            white-space: pre-wrap; overflow-y: auto; 
-        }
-        
-        .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 10px 20px; border-radius: 20px; font-size: 14px; opacity: 0; pointer-events: none; transition: opacity 0.3s; z-index: 999; backdrop-filter: blur(5px); }
-        .toast.show { opacity: 1; top: 30px; }
-
-
-        /* =========================================
-           2. 桌面端 (Desktop) 
-           - 双栏布局
-           - 允许滚动，但日志区域尽可能大
-           ========================================= */
-        @media (min-width: 769px) {
-            .container { max-width: 1200px; margin: 30px auto; padding: 0 20px; }
-            
-            /* 上半部分：并排两个卡片 */
-            .panels-grid {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 20px;
-                align-items: start; /* 防止高度被强制拉伸 */
-            }
-
-            /* 下半部分：日志 */
-            .log-card {
-                /* 
-                   高度逻辑：
-                   尝试占据屏幕剩余高度 (100vh - 约400px头部和间距)
-                   但最少不小于 500px，保证大屏舒服，小屏能滚
-                */
-                height: calc(100vh - 400px);
-                min-height: 500px; 
-            }
-            .log-container {
-                height: 100%;
-                font-size: 13px;
-                border-radius: 0 0 16px 16px;
-            }
-
-            /* 账号选择器PC端样式 */
-            .account-control { display: flex; align-items: center; gap: 10px; }
-            .account-control select { max-width: 250px; }
-        }
-
-
-        /* =========================================
-           3. 移动端 (Mobile)
-           - 单栏堆叠
-           - 重点修复下拉框溢出
-           ========================================= */
-        @media (max-width: 768px) {
-            .container { padding: 15px; margin-top: 10px; }
-            
-            .panels-grid { display: block; } /* 恢复默认块级堆叠 */
-
-            .row-item { flex-direction: column; align-items: flex-start; gap: 10px; }
-            
-            /* 操作区（右侧）占满整行 */
-            .row-item > div:last-child:not(:first-child) {
-                width: 100%;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }
-            .row-value { margin-top: 5px; }
-
-            /* 
-               [关键修复] 账号选择器防溢出逻辑 
-               flex: 1 + width: 0 强制收缩
-            */
-            .account-control {
-                width: 100%;
-                display: flex;
-                gap: 8px;
-                align-items: center;
-            }
-            .account-control select {
-                flex: 1;      /* 占据剩余空间 */
-                width: 0;     /* 触发收缩计算 */
-                min-width: 0; /* 允许截断 */
-            }
-            .account-control .action-btn {
-                flex-shrink: 0; /* 按钮不要被挤扁 */
-            }
-
-            /* 移动端日志高度固定，不占太多屏幕 */
-            .log-container {
-                height: 350px;
-                font-size: 11px;
-                border-radius: 0 0 16px 16px;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="toast" id="toast">操作已保存</div>
-    
-    <div class="container">
-        <!-- 头部 -->
-        <div class="header">
-            <h1>代理控制台</h1>
-            <div class="status-badge">
-                <div class="status-dot" id="browserStatusDot"></div>
-                <span id="browserStatusText">Checking...</span>
+        </style>
+    </head>
+    <body>
+        <div class="container">
+        <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
+        <div id="status-section">
+            <pre>
+<span class="label">服务状态</span>: <span class="status-ok">Running</span>
+<span class="label">浏览器连接</span>: <span class="${
+        browserManager.browser ? "status-ok" : "status-error"
+      }">${!!browserManager.browser}</span>
+--- 服务配置 ---
+<span class="label">流模式</span>: ${
+        config.streamingMode
+      } (仅启用流式传输时生效)
+<span class="label">强制推理</span>: ${
+        this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
+      }
+<span class="label">立即切换 (状态码)</span>: ${
+        config.immediateSwitchStatusCodes.length > 0
+          ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
+          : "已禁用"
+      }
+<span class="label">API 密钥</span>: ${config.apiKeySource}
+--- 账号状态 ---
+<span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
+<span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
+        config.switchOnUses > 0 ? config.switchOnUses : "N/A"
+      }
+<span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${
+        config.failureThreshold > 0 ? config.failureThreshold : "N/A"
+      }
+<span class="label">扫描到的总帐号</span>: [${initialIndices.join(
+        ", "
+      )}] (总数: ${initialIndices.length})
+      ${accountDetailsHtml}
+<span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
+        ", "
+      )}] (总数: ${invalidIndices.length})
+            </pre>
+        </div>
+        <div id="actions-section" style="margin-top: 2em;">
+            <h2>操作面板</h2>
+            <div class="action-group">
+                <select id="accountIndexSelect">${accountOptionsHtml}</select>
+                <button onclick="switchSpecificAccount()">切换账号</button>
+                <button onclick="toggleStreamingMode()">切换流模式</button>
+                <button onclick="toggleForceThinking()">切换强制推理</button>
             </div>
         </div>
-
-        <!-- 功能面板区 -->
-        <div class="panels-grid">
-            <!-- 系统配置 -->
-            <div class="card">
-                <div class="card-header">系统配置</div>
-                <div class="card-body">
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">流式响应模式 (Stream Mode)</div>
-                            <div class="row-desc">开启为 Real (真流式)，关闭为 Fake (伪流式)</div>
-                        </div>
-                        <div>
-                            <label class="switch">
-                                <input type="checkbox" id="streamModeSwitch" onchange="toggleStreamMode()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">强制 OAI 格式推理</div>
-                            <div class="row-desc">为 OpenAI 格式请求注入 thinkingConfig</div>
-                        </div>
-                        <div>
-                            <label class="switch">
-                                <input type="checkbox" id="reasoningSwitch" onchange="toggleReasoning()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">强制原生格式推理</div>
-                            <div class="row-desc">为 Gemini 原生请求注入 thinkingConfig</div>
-                        </div>
-                        <div>
-                            <label class="switch">
-                                <input type="checkbox" id="nativeReasoningSwitch" onchange="toggleNativeReasoning()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">模型版本重定向</div>
-                            <div class="row-desc">将 gemini-2.5-pro 自动重定向至 3.0-pro</div>
-                        </div>
-                        <div>
-                            <label class="switch">
-                                <input type="checkbox" id="redirectSwitch" onchange="toggleRedirect()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">截断自动续写</div>
-                            <div class="row-desc">内容被截断时自动尝试继续生成</div>
-                        </div>
-                        <div style="display: flex; align-items: center;">
-                            <input type="number" class="num-input" id="resumeLimitInput" value="3" min="1" max="10" placeholder="次">
-                            <label class="switch">
-                                <input type="checkbox" id="resumeSwitch" onchange="toggleResume()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 账号管理 -->
-            <div class="card">
-                <div class="card-header">账号管理</div>
-                <div class="card-body">
-                    <div class="row-item">
-                        <div>
-                            <div class="row-label">当前账号</div>
-                            <!-- 已移除使用次数统计，避免误解为额度限制 -->
-                        </div>
-                        <div class="row-value" id="currentAccountBadge">#--</div>
-                    </div>
-                    <div class="row-item">
-                        <div class="row-label">手动切换账号</div>
-                        <!-- 账号选择控件容器 -->
-                        <div class="account-control">
-                            <select id="accountSelector"></select>
-                            <button class="action-btn" onclick="switchAccount()">切换</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
+        <div id="log-section" style="margin-top: 2em;">
+            <h2>实时日志 (最近 ${logs.length} 条)</h2>
+            <pre id="log-container">${logs.join("\n")}</pre>
         </div>
-
-        <!-- 日志卡片 (单独放在下面) -->
-        <div class="card log-card">
-            <div class="card-header">实时日志</div>
-            <div class="log-container" id="logContainer">Waiting for logs...</div>
         </div>
-    </div>
-
-    <script>
-        let isUpdating = false;
-
-        function showToast(msg) {
-            const t = document.getElementById('toast');
-            t.textContent = msg;
-            t.classList.add('show');
-            setTimeout(() => t.classList.remove('show'), 2000);
+        <script>
+        function updateContent() {
+            fetch('/api/status').then(response => response.json()).then(data => {
+                const statusPre = document.querySelector('#status-section pre');
+                const accountDetailsHtml = data.status.accountDetails.map(acc => {
+                  return '<span class="label" style="padding-left: 20px;">账号' + acc.index + '</span>: ' + acc.name;
+                }).join('\\n');
+                statusPre.innerHTML = 
+                    '<span class="label">服务状态</span>: <span class="status-ok">Running</span>\\n' +
+                    '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
+                    '--- 服务配置 ---\\n' +
+                    '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
+                    '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
+                    '<span class="label">立即切换 (状态码)</span>: ' + data.status.immediateSwitchStatusCodes + '\\n' +
+                    '<span class="label">API 密钥</span>: ' + data.status.apiKeySource + '\\n' +
+                    '--- 账号状态 ---\\n' +
+                    '<span class="label">当前使用账号</span>: #' + data.status.currentAuthIndex + '\\n' +
+                    '<span class="label">使用次数计数</span>: ' + data.status.usageCount + '\\n' +
+                    '<span class="label">连续失败计数</span>: ' + data.status.failureCount + '\\n' +
+                    '<span class="label">扫描到的总账号</span>: ' + data.status.initialIndices + '\\n' +
+                    accountDetailsHtml + '\\n' +
+                    '<span class="label">格式错误 (已忽略)</span>: ' + data.status.invalidIndices;
+                
+                const logContainer = document.getElementById('log-container');
+                const logTitle = document.querySelector('#log-section h2');
+                const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
+                logTitle.innerText = \`实时日志 (最近 \${data.logCount} 条)\`;
+                logContainer.innerText = data.logs;
+                if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
+            }).catch(error => console.error('Error fetching new content:', error));
         }
 
-        async function apiCall(url, body) {
-            try {
-                const res = await fetch(url, {
+        function switchSpecificAccount() {
+            const selectElement = document.getElementById('accountIndexSelect');
+            const targetIndex = selectElement.value;
+            if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
+                return;
+            }
+            fetch('/api/switch-account', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body)
-                });
-                if(res.ok) {
-                    showToast('设置已更新');
-                    updateStatus();
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ targetIndex: parseInt(targetIndex, 10) })
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => { 
+                if (err.message.includes('Load failed') || err.message.includes('NetworkError')) {
+                    alert('⚠️ 浏览器启动较慢，操作仍在后台进行中。\\n\\n请不要重复点击。');
                 } else {
-                    alert('操作失败');
+                    alert('❌ 操作失败: ' + err); 
                 }
-            } catch(e) {
-                alert('网络错误');
-            }
+                updateContent(); 
+            });
+        }
+            
+        function toggleStreamingMode() { 
+            const newMode = prompt('请输入新的流模式 (real 或 fake):', '${
+              this.config.streamingMode
+            }');
+            if (newMode === 'fake' || newMode === 'real') {
+                fetch('/api/set-mode', { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/json' }, 
+                    body: JSON.stringify({ mode: newMode }) 
+                })
+                .then(res => res.text()).then(data => { alert(data); updateContent(); })
+                .catch(err => alert('设置失败: ' + err));
+            } else if (newMode !== null) { 
+                alert('无效的模式！请只输入 "real" 或 "fake"。'); 
+            } 
         }
 
-        function toggleStreamMode() {
-            if(isUpdating) return;
-            const mode = document.getElementById('streamModeSwitch').checked ? 'real' : 'fake';
-            apiCall('/api/set-mode', { mode });
-        }
-        function toggleReasoning() { if(!isUpdating) apiCall('/api/toggle-reasoning', {}); }
-        function toggleNativeReasoning() { if(!isUpdating) apiCall('/api/toggle-native-reasoning', {}); }
-        function toggleRedirect() { if(!isUpdating) apiCall('/api/toggle-redirect-25-30', {}); }
-        function toggleResume() {
-            if(isUpdating) return;
-            const enabled = document.getElementById('resumeSwitch').checked;
-            let limit = parseInt(document.getElementById('resumeLimitInput').value) || 3;
-            if (!enabled) limit = 0;
-            apiCall('/api/set-resume-config', { limit });
-        }
-
-        async function switchAccount() {
-            const idx = document.getElementById('accountSelector').value;
-            if(!confirm('确定切换到账号 #' + idx + ' 吗？这会重置当前浏览器会话。')) return;
-            showToast('正在切换...');
-            try {
-                const res = await fetch('/api/switch-account', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ targetIndex: parseInt(idx) })
-                });
-                showToast(res.ok ? '切换成功' : '切换失败');
-                updateStatus();
-            } catch(e) { alert('请求失败'); }
-        }
-
-        function updateStatus() {
-            isUpdating = true;
-            fetch('/api/status').then(r => r.json()).then(data => {
-                const s = data.status;
-                const dot = document.getElementById('browserStatusDot');
-                dot.className = s.browserConnected ? 'status-dot active' : 'status-dot';
-                document.getElementById('browserStatusText').textContent = s.browserConnected ? '服务运行中' : '浏览器未连接';
-
-                document.getElementById('streamModeSwitch').checked = s.streamingMode.startsWith('real');
-                document.getElementById('reasoningSwitch').checked = s.enableReasoning;
-                document.getElementById('nativeReasoningSwitch').checked = s.enableNativeReasoning;
-                document.getElementById('redirectSwitch').checked = s.redirect25to30;
-                document.getElementById('resumeSwitch').checked = s.enableResume;
-                if(s.resumeLimit > 0) document.getElementById('resumeLimitInput').value = s.resumeLimit;
-
-                document.getElementById('currentAccountBadge').textContent = '#' + s.currentAuthIndex;
-                // 已移除 usageStats 更新逻辑
-
-                const selector = document.getElementById('accountSelector');
-                // [修复1] 防闪烁：只有当下拉框没有被聚焦（用户没在操作）时才更新
-                if (document.activeElement !== selector) {
-                    const savedVal = selector.value;
-                    selector.innerHTML = '';
-                    
-                    // [修复2] 响应式截断：判断当前屏幕宽度
-                    const isMobile = window.innerWidth <= 768;
-
-                    s.accountDetails.forEach(acc => {
-                        const opt = document.createElement('option');
-                        opt.value = acc.index;
-                        let name = acc.name || 'Account';
-                        
-                        // [逻辑变更] 只有在移动端(宽度<=768) 且 名字过长时才截断，PC端全显
-                        if(isMobile && name.length > 50) {
-                            name = name.substring(0, 48) + '...';
-                        }
-                        
-                        opt.textContent = '#' + acc.index + ' - ' + name;
-                        if(acc.index == s.currentAuthIndex) opt.textContent += ' (当前)';
-                        selector.appendChild(opt);
-                    });
-                    if(savedVal) selector.value = savedVal;
-                }
-
-                const logBox = document.getElementById('logContainer');
-                const atBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 50;
-                logBox.textContent = data.logs;
-                if(atBottom) logBox.scrollTop = logBox.scrollHeight;
-
-            }).finally(() => { isUpdating = false; });
+        function toggleForceThinking() {
+            fetch('/api/toggle-force-thinking', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('设置失败: ' + err));
         }
 
         document.addEventListener('DOMContentLoaded', () => {
-            updateStatus();
-            setInterval(updateStatus, 3000);
+            updateContent(); 
+            setInterval(updateContent, 5000);
         });
-    </script>
-</body>
-</html>`;
+        </script>
+    </body>
+    </html>
+    `;
       res.status(200).send(statusHtml);
     });
 
@@ -2805,15 +2932,7 @@ class ProxyServerSystem extends EventEmitter {
       const data = {
         status: {
           streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
-          // [新增] 返回推理模式状态
-          enableReasoning: this.enableReasoning, 
-          // [新增] 返回原生推理模式状态
-          enableNativeReasoning: this.enableNativeReasoning,
-          // [新增] 返回续写状态
-          enableResume: this.enableResume,
-          resumeLimit: this.resumeLimit, // [新增] 返回次数限制
-          // [新增] 返回重定向状态
-          redirect25to30: this.redirect25to30,
+          forceThinking: this.forceThinking ? "✅ 已启用" : "❌ 已关闭",
           browserConnected: !!browserManager.browser,
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
@@ -2823,6 +2942,9 @@ class ProxyServerSystem extends EventEmitter {
           currentAuthIndex: requestHandler.currentAuthIndex,
           usageCount: `${requestHandler.usageCount} / ${
             config.switchOnUses > 0 ? config.switchOnUses : "N/A"
+          }`,
+          failureCount: `${requestHandler.failureCount} / ${
+            config.failureThreshold > 0 ? config.failureThreshold : "N/A"
           }`,
           initialIndices: `[${initialIndices.join(", ")}] (总数: ${
             initialIndices.length
@@ -2890,57 +3012,30 @@ class ProxyServerSystem extends EventEmitter {
         res.status(400).send('无效模式. 请用 "fake" 或 "real".');
       }
     });
-    
-    // ==========================================================
-    // [新增] 切换推理模式 (Toggle Reasoning) 接口 - 适配 OAI
-    // ==========================================================
-    app.post("/api/toggle-reasoning", isAuthenticated, (req, res) => {
-      this.enableReasoning = !this.enableReasoning;
-      const statusText = this.enableReasoning ? "已启用" : "已禁用";
-      this.logger.info(`[WebUI] 强制OAI格式推理 (Thinking) 状态已切换为: ${statusText}`);
-      res.status(200).send(`强制OAI格式推理(Thinking)${statusText}。所有新的 OpenAI 格式请求都将受此影响。`);
-    });
 
-    // ==========================================================
-    // [新增] 切换原生推理模式 (Toggle Native Reasoning) 接口
-    // ==========================================================
-    app.post("/api/toggle-native-reasoning", isAuthenticated, (req, res) => {
-      this.enableNativeReasoning = !this.enableNativeReasoning;
-      const statusText = this.enableNativeReasoning ? "已启用" : "已禁用";
-      this.logger.info(`[WebUI] 强制原生格式推理 (Native Thinking) 状态已切换为: ${statusText}`);
-      res.status(200).send(`强制原生格式推理${statusText}。所有新的原生 Gemini 格式请求都将受此影响。`);
-    });
-
-    // ==========================================================
-    // [新增] 设置续写配置 (Set Resume Config) 接口
-    // ==========================================================
-    app.post("/api/set-resume-config", isAuthenticated, (req, res) => {
-      const limit = parseInt(req.body.limit, 10);
-      if (isNaN(limit) || limit < 0) {
-          return res.status(400).send("无效的重试次数数值。");
-      }
-      this.resumeLimit = limit;
-      this.enableResume = limit > 0;
-      
-      const statusText = this.enableResume ? `已启用 (重试限制: ${limit})` : "已关闭";
-      this.logger.info(`[WebUI] 截断自动续写功能配置更新: ${statusText}`);
-      res.status(200).send(`自动续写功能${statusText}。`);
-    });
-
-    // ==========================================================
-    // [新增] 切换 2.5 Pro 重定向到 3.0 Pro 接口
-    // ==========================================================
-    app.post("/api/toggle-redirect-25-30", isAuthenticated, (req, res) => {
-      this.redirect25to30 = !this.redirect25to30;
-      const statusText = this.redirect25to30 ? "已启用" : "已禁用";
-      this.logger.info(`[WebUI] 2.5Pro重定向为3.0Pro 功能已切换为: ${statusText}`);
-      res.status(200).send(`2.5Pro重定向为3.0Pro 功能${statusText}。`);
+    app.post("/api/toggle-force-thinking", isAuthenticated, (req, res) => {
+      this.forceThinking = !this.forceThinking;
+      const statusText = this.forceThinking ? "已启用" : "已关闭";
+      this.logger.info(`[WebUI] 强制推理开关已切换为: ${statusText}`);
+      res.status(200).send(`强制推理模式: ${statusText}`);
     });
 
     app.use(this._createAuthMiddleware());
 
     app.get("/v1/models", (req, res) => {
-      this.requestHandler.processModelListRequest(req, res);
+      const modelIds = this.config.modelList || ["gemini-2.5-pro"];
+
+      const models = modelIds.map((id) => ({
+        id: id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "google",
+      }));
+
+      res.status(200).json({
+        object: "list",
+        data: models,
+      });
     });
 
     app.post("/v1/chat/completions", (req, res) => {
@@ -2986,3 +3081,4 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
+

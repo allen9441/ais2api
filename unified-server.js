@@ -1857,7 +1857,7 @@ class RequestHandler {
     try {
       let lastChunk = "";
       while (true) {
-        const dataMessage = await messageQueue.dequeue(30000);
+        const dataMessage = await messageQueue.dequeue(this.config.streamTimeout);
         if (dataMessage.type === "STREAM_END") {
           this.logger.info("[Request] 收到流结束信号。");
           break;
@@ -2356,6 +2356,7 @@ class ProxyServerSystem extends EventEmitter {
       switchOnUses: 40,
       maxRetries: 1,
       retryDelay: 2000,
+      streamTimeout: 60000,
       browserExecutablePath: null,
       apiKeys: [],
       immediateSwitchStatusCodes: [429, 503],
@@ -2391,6 +2392,9 @@ class ProxyServerSystem extends EventEmitter {
     if (process.env.RETRY_DELAY)
       config.retryDelay =
         parseInt(process.env.RETRY_DELAY, 10) || config.retryDelay;
+    if (process.env.STREAM_TIMEOUT)
+      config.streamTimeout = 
+        parseInt(process.env.STREAM_TIMEOUT, 10) || 60000; 
     if (process.env.CAMOUFOX_EXECUTABLE_PATH)
       config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
     if (process.env.API_KEYS) {
@@ -2487,6 +2491,7 @@ class ProxyServerSystem extends EventEmitter {
     );
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
     this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
+    this.logger.info(`  流式timeout時長: ${this.config.streamTimeout}ms`);
     this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
     this.logger.info(
       "============================================================="

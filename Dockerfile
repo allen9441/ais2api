@@ -48,6 +48,7 @@ EXPOSE 9998
 
 # 设置环境变量
 ENV CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox
+ENV STREAM_TIMEOUT = 60000
 
 # 定义容器启动命令
 CMD ["node", "unified-server.js"]

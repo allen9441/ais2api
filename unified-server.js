@@ -1450,7 +1450,7 @@ class RequestHandler {
           const streamState = { inThought: false };
 
           while (true) {
-            const message = await messageQueue.dequeue(300000); // 5分钟超时
+            const message = await messageQueue.dequeue(this.config.responseTimeout);
             if (message.type === "STREAM_END") {
               if (streamState.inThought) {
                 const closeThoughtPayload = {
@@ -1489,7 +1489,7 @@ class RequestHandler {
 
           let fullBody = "";
           while (true) {
-            const message = await messageQueue.dequeue(300000);
+            const message = await messageQueue.dequeue(this.config.responseTimeout);
             if (message.type === "STREAM_END") break;
             if (message.data) fullBody += message.data;
           }
@@ -1509,7 +1509,7 @@ class RequestHandler {
       } else {
         let fullBody = "";
         while (true) {
-          const message = await messageQueue.dequeue(300000);
+          const message = await messageQueue.dequeue(this.config.responseTimeout);
           if (message.type === "STREAM_END") {
             break;
           }
@@ -1713,9 +1713,9 @@ class RequestHandler {
             setTimeout(
               () =>
                 reject(
-                  new Error("Response from browser timed out after 300 seconds")
+                  new Error(`Response from browser timed out after ${this.config.responseTimeout / 1000} seconds`)
                 ),
-              300000
+              this.config.responseTimeout
             )
           );
           lastMessage = await Promise.race([
@@ -1922,7 +1922,7 @@ class RequestHandler {
       // 2. 准备一个缓冲区，并确保循环等待直到收到结束信号
       let fullBody = "";
       while (true) {
-        const message = await messageQueue.dequeue(300000);
+        const message = await messageQueue.dequeue(this.config.responseTimeout);
         if (message.type === "STREAM_END") {
           this.logger.info("[Request] 收到结束信号，数据接收完毕。");
           break;
@@ -2357,6 +2357,7 @@ class ProxyServerSystem extends EventEmitter {
       maxRetries: 1,
       retryDelay: 2000,
       streamTimeout: 60000,
+      responseTimeout: 600000,
       browserExecutablePath: null,
       apiKeys: [],
       immediateSwitchStatusCodes: [429, 503],
@@ -2395,6 +2396,9 @@ class ProxyServerSystem extends EventEmitter {
     if (process.env.STREAM_TIMEOUT)
       config.streamTimeout = 
         parseInt(process.env.STREAM_TIMEOUT, 10) || 60000; 
+    if (process.env.RESPONSE_TIMEOUT)
+      config.responseTimeout = 
+        parseInt(process.env.RESPONSE_TIMEOUT, 10) || 300000; 
     if (process.env.CAMOUFOX_EXECUTABLE_PATH)
       config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
     if (process.env.API_KEYS) {
@@ -2492,6 +2496,7 @@ class ProxyServerSystem extends EventEmitter {
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
     this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
     this.logger.info(`  流式timeout時長: ${this.config.streamTimeout}ms`);
+    this.logger.info(`  響應timeout時長: ${this.config.responseTimeout}ms`);
     this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
     this.logger.info(
       "============================================================="
@@ -3086,4 +3091,3 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
-

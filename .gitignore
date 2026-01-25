@@ -1,2 +1,5 @@
 app.env
 auth
+camoufox
+node_modules
+package-lock.json

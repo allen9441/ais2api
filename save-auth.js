@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 
 // --- 配置常量 ---
-const browserExecutablePath = path.join(__dirname, "camoufox", "camoufox.exe");
+const browserExecutablePath = path.join(__dirname, "camoufox", "camoufox");
 const VALIDATION_LINE_THRESHOLD = 200; // 定义验证的行数阈值
 const AUTH_DIR = "auth"; // 格式化认证文件的文件夹
 const SINGLE_LINE_AUTH_DIR = "single-line-auth"; // 单行认证文件的文件夹
